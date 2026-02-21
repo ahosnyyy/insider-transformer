@@ -437,15 +437,16 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
     Feature order matches feature_engineering.py:
     1. continuous features
     2. interaction features
-    3. user_normalized features (with _zscore, _rolling_mean, _rolling_std suffixes)
-    4. cyclical features
-    5. binary features
+    3. session features
+    4. user_normalized features (with _zscore, _rolling_mean, _rolling_std suffixes)
+    5. cyclical features
+    6. binary features
     """
     x_c = torch.tensor(x_cont, dtype=torch.float32).to(device)
     x_cat_t = torch.tensor(x_cat, dtype=torch.long).to(device)
 
     with torch.no_grad():
-        predictions, mask = model(x_c, x_cat_t, mask=None)
+        predictions = model(x_c, x_cat_t)
 
     diff = (predictions - x_c).pow(2)
     per_feat_error = diff.mean(dim=(0, 1)).cpu().numpy()
@@ -453,15 +454,16 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
     # Build feature list in the same order as feature_engineering.py
     cont_features = config.get('features', {}).get('continuous', [])
     interaction_features = config.get('features', {}).get('interaction', [])
+    session_features = config.get('features', {}).get('session', [])
     user_norm = config.get('features', {}).get('user_normalized', [])
     cyclical = config.get('features', {}).get('cyclical', [])
     binary = config.get('features', {}).get('binary', [])
-    
-    # Build scalable_cols (continuous + interaction + user_normalized variants)
-    scalable_cols = list(cont_features) + list(interaction_features)
+
+    # Build scalable_cols (continuous + interaction + session + user_normalized variants)
+    scalable_cols = list(cont_features) + list(interaction_features) + list(session_features)
     for col in user_norm:
         scalable_cols.extend([f'{col}_zscore', f'{col}_rolling_mean', f'{col}_rolling_std'])
-    
+
     # Final order: scalable + cyclical + binary
     all_features = scalable_cols + list(cyclical) + list(binary)
 
@@ -498,6 +500,26 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
         'external_email_attachments': 'External email with attachments',
         'http_after_hours': 'After-hours web browsing',
         'email_after_hours': 'After-hours email activity',
+        # Session-derived features
+        'sess_count': 'Unusual number of sessions',
+        'mean_session_duration': 'Unusual session duration pattern',
+        'max_session_duration': 'Unusually long session',
+        'std_session_duration': 'Erratic session durations',
+        'total_session_time': 'Unusual total session time',
+        'num_after_hours_sessions': 'After-hours session activity',
+        'after_hours_session_ratio': 'High after-hours session ratio',
+        'earliest_session_hour': 'Unusually early session start',
+        'latest_session_hour': 'Unusually late session start',
+        'session_hour_spread': 'Wide session time spread',
+        'mean_session_event_count': 'Unusual events per session',
+        'max_session_event_count': 'Session with high event count',
+        'mean_session_entropy': 'Unusual session activity mix',
+        'num_usb_sessions': 'Multiple USB sessions',
+        'num_exe_sessions': 'Sessions with executable copies',
+        'longest_inter_session_gap': 'Unusual gap between sessions',
+        'usb_after_hours_sessions': 'After-hours USB session',
+        'file_heavy_sessions': 'Sessions with heavy file copying',
+        'short_usb_sessions': 'Short USB grab session',
         # User-normalized features (zscore indicates deviation from user baseline)
         'http_request_count_zscore': 'Web browsing deviation from user baseline',
         'http_request_count_rolling_mean': 'Web browsing rolling average',
@@ -511,6 +533,15 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
         'total_actions_zscore': 'Activity level deviation from user baseline',
         'total_actions_rolling_mean': 'Activity level rolling average',
         'total_actions_rolling_std': 'Activity level rolling variability',
+        'sess_count_zscore': 'Session count deviation from user baseline',
+        'sess_count_rolling_mean': 'Session count rolling average',
+        'sess_count_rolling_std': 'Session count rolling variability',
+        'mean_session_duration_zscore': 'Session duration deviation from user baseline',
+        'mean_session_duration_rolling_mean': 'Session duration rolling average',
+        'mean_session_duration_rolling_std': 'Session duration rolling variability',
+        'total_session_time_zscore': 'Total session time deviation from user baseline',
+        'total_session_time_rolling_mean': 'Total session time rolling average',
+        'total_session_time_rolling_std': 'Total session time rolling variability',
         # Cyclical features
         'hour_sin': 'Time-of-day pattern',
         'hour_cos': 'Time-of-day pattern',
@@ -557,15 +588,291 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
     return indicators
 
 
+# =========================================================================
+# Session-Level Evaluation
+# =========================================================================
+
+def load_sessions_from_duckdb(config, project_root=None):
+    """Load the sessions and session_features tables from DuckDB.
+
+    Returns:
+        dict with 'sessions' and 'events_by_session' DataFrames (as lists of dicts),
+        or None if unavailable.
+    """
+    try:
+        import duckdb
+        if project_root is None:
+            project_root = Path(__file__).parent.parent.parent
+        db_path = Path(project_root) / config['data']['duckdb_path']
+        if not db_path.exists():
+            return None
+
+        conn = duckdb.connect(str(db_path), read_only=True)
+
+        # Check if sessions table exists
+        tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+        if 'sessions' not in tables:
+            conn.close()
+            return None
+
+        sessions = conn.execute("""
+            SELECT session_id, user_id, pc, session_date, session_start,
+                   session_end, duration_min, is_after_hours, hour_of_start
+            FROM sessions
+            ORDER BY user_id, session_start
+        """).fetchall()
+
+        cols = ['session_id', 'user_id', 'pc', 'session_date', 'session_start',
+                'session_end', 'duration_min', 'is_after_hours', 'hour_of_start']
+        session_dicts = [dict(zip(cols, row)) for row in sessions]
+
+        conn.close()
+        return session_dicts
+
+    except (ImportError, Exception):
+        return None
+
+
+def compute_session_metrics(scores, y_true, y_pred, user_ids, timestamps,
+                            insider_meta, session_data, threshold):
+    """Compute session-level evaluation metrics.
+
+    Maps flagged days back to individual sessions and compares against
+    ground-truth insider activity timestamps.
+
+    Args:
+        scores: anomaly scores per sequence
+        y_true: ground truth labels per sequence
+        y_pred: predicted labels per sequence
+        user_ids: user ID per sequence
+        timestamps: date per sequence (datetime64)
+        insider_meta: dict user_id -> {start_date, end_date, ...}
+        session_data: list of session dicts from load_sessions_from_duckdb
+        threshold: anomaly threshold
+
+    Returns:
+        dict with session-level metrics
+    """
+    if session_data is None or insider_meta is None or timestamps is None:
+        return None
+
+    # Build lookup: (user_id, date_str) -> list of sessions
+    sessions_by_user_date = defaultdict(list)
+    for s in session_data:
+        date_str = str(s['session_date'])
+        sessions_by_user_date[(s['user_id'], date_str)].append(s)
+
+    # For each insider user, find flagged days and check session overlap
+    insider_users = set(insider_meta.keys())
+    total_insider_sessions = 0
+    flagged_insider_sessions = 0
+    total_flagged_sessions = 0
+    correct_localizations = 0
+    total_flagged_days = 0
+
+    for uid in insider_users:
+        meta = insider_meta[uid]
+        gt_start = meta.get('start_date')
+        gt_end = meta.get('end_date')
+        if not gt_start or not gt_end:
+            continue
+
+        gt_start_dt = np.datetime64(gt_start)
+        gt_end_dt = np.datetime64(gt_end)
+
+        mask = user_ids == uid
+        u_scores = scores[mask]
+        u_ts = timestamps[mask]
+        u_pred = y_pred[mask]
+
+        for i, (score, ts, pred) in enumerate(zip(u_scores, u_ts, u_pred)):
+            if np.isnat(ts):
+                continue
+            date_str = str(np.datetime64(ts, 'D'))
+            day_sessions = sessions_by_user_date.get((uid, date_str), [])
+
+            # Count insider sessions (sessions during ground-truth period)
+            is_insider_day = gt_start_dt <= np.datetime64(ts, 'D') <= gt_end_dt
+            if is_insider_day:
+                for s in day_sessions:
+                    total_insider_sessions += 1
+                    if s.get('is_after_hours', 0) == 1:
+                        total_insider_sessions  # already counted
+
+            if pred == 1:
+                total_flagged_days += 1
+                # All sessions on a flagged day are "flagged"
+                for s in day_sessions:
+                    total_flagged_sessions += 1
+                    if is_insider_day:
+                        flagged_insider_sessions += 1
+
+                # Localization: was the most suspicious session on this day
+                # actually during the insider period?
+                if is_insider_day and day_sessions:
+                    # The most suspicious session is the after-hours one
+                    # or the one with highest duration (heuristic)
+                    has_after_hours = any(
+                        s.get('is_after_hours', 0) == 1 for s in day_sessions
+                    )
+                    if has_after_hours:
+                        correct_localizations += 1
+
+    session_precision = (flagged_insider_sessions / max(total_flagged_sessions, 1))
+    session_recall = (flagged_insider_sessions / max(total_insider_sessions, 1))
+    session_f1 = (2 * session_precision * session_recall /
+                  max(session_precision + session_recall, 1e-10))
+    localization_acc = (correct_localizations / max(total_flagged_days, 1))
+
+    return {
+        'session_precision': round(float(session_precision), 4),
+        'session_recall': round(float(session_recall), 4),
+        'session_f1': round(float(session_f1), 4),
+        'session_localization_accuracy': round(float(localization_acc), 4),
+        'total_insider_sessions': int(total_insider_sessions),
+        'flagged_insider_sessions': int(flagged_insider_sessions),
+        'total_flagged_sessions': int(total_flagged_sessions),
+        'total_flagged_days': int(total_flagged_days),
+        'correct_localizations': int(correct_localizations),
+    }
+
+
+def build_session_drilldown(uid, flagged_dates, session_data, config,
+                            project_root=None):
+    """Build session-level drill-down for a flagged user's anomalous days.
+
+    Args:
+        uid: user ID
+        flagged_dates: list of date strings (YYYY-MM-DD) that were flagged
+        session_data: list of session dicts
+        config: config dict
+        project_root: project root path
+
+    Returns:
+        list of day dicts, each containing sessions with risk assessment
+    """
+    if session_data is None:
+        return []
+
+    # Build lookup for this user
+    user_sessions = defaultdict(list)
+    for s in session_data:
+        if s['user_id'] == uid:
+            date_str = str(s['session_date'])
+            user_sessions[date_str].append(s)
+
+    # Load raw events for drill-down
+    events_by_session = {}
+    try:
+        import duckdb
+        if project_root is None:
+            project_root = Path(__file__).parent.parent.parent
+        db_path = Path(project_root) / config['data']['duckdb_path']
+        if db_path.exists():
+            conn = duckdb.connect(str(db_path), read_only=True)
+            for date_str in flagged_dates:
+                for s in user_sessions.get(date_str, []):
+                    sid = s['session_id']
+                    rows = conn.execute(f"""
+                        SELECT
+                            CAST(datetime AS VARCHAR) AS time,
+                            activity AS type,
+                            COALESCE(filename, url,
+                                CASE WHEN activity='Email' THEN 'to: ' || COALESCE(to_addr, '')
+                                     ELSE NULL END,
+                                activity) AS detail
+                        FROM events
+                        WHERE user_id = '{uid}'
+                          AND datetime >= '{s['session_start']}'
+                          AND datetime <= '{s['session_end']}'
+                        ORDER BY datetime
+                        LIMIT 20
+                    """).fetchall()
+                    events_by_session[sid] = [
+                        {'time': r[0], 'type': r[1], 'detail': r[2]}
+                        for r in rows
+                    ]
+            conn.close()
+    except (ImportError, Exception):
+        pass
+
+    days = []
+    for date_str in flagged_dates:
+        day_sessions = user_sessions.get(date_str, [])
+        session_entries = []
+        for s in day_sessions:
+            is_ah = s.get('is_after_hours', 0) == 1
+            dur = s.get('duration_min', 0)
+
+            # Heuristic risk assessment
+            risk = 'low'
+            indicators = []
+            if is_ah:
+                risk = 'medium'
+                indicators.append(f"After-hours session ({s.get('hour_of_start', '?')}:00)")
+            if dur < 15:
+                indicators.append("Short session (<15 min)")
+                if is_ah:
+                    risk = 'high'
+
+            sid = s['session_id']
+            events = events_by_session.get(sid, [])
+
+            # Check events for high-risk patterns
+            has_usb = any(e['type'] in ('Connect', 'Disconnect') for e in events)
+            has_exe = any(e.get('detail', '').endswith(('.exe', '.msi', '.bat'))
+                         for e in events)
+            has_file = any(e['type'] == 'File' for e in events)
+
+            if has_usb:
+                indicators.append("USB device activity")
+                risk = 'high' if is_ah else 'medium'
+            if has_exe:
+                indicators.append("Executable file copied")
+                risk = 'high'
+            if has_file and dur < 15:
+                indicators.append("File activity in short session")
+
+            # Build summary
+            type_counts = defaultdict(int)
+            for e in events:
+                type_counts[e['type']] += 1
+            summary_parts = [f"{cnt} {typ}" for typ, cnt in type_counts.items()]
+            summary = f"{dur:.0f}-min session: " + ", ".join(summary_parts) if summary_parts else f"{dur:.0f}-min session"
+
+            entry = {
+                'session_id': sid,
+                'start': str(s.get('session_start', '')),
+                'end': str(s.get('session_end', '')),
+                'duration_min': round(dur, 1),
+                'risk': risk,
+                'summary': summary,
+            }
+            if indicators:
+                entry['indicators'] = indicators
+            if events and risk in ('medium', 'high'):
+                entry['events'] = events[:10]
+
+            session_entries.append(entry)
+
+        days.append({
+            'date': date_str,
+            'sessions': session_entries,
+        })
+
+    return days
+
+
 def generate_soc_report(user_results, scores, y_true, user_ids,
                         timestamps, insider_meta, threshold, threshold_method,
                         model, X_test_cont, X_test_cat, config, device,
-                        output_dir):
-    """Generate a structured SOC alert report (JSON).
+                        output_dir, session_data=None):
+    """Generate a structured SOC alert report (JSON) with session drill-down.
 
     Args:
         y_true: Can be None for deployment mode (no ground truth). In that
             case, anomalous sequences are identified purely by threshold.
+        session_data: Optional list of session dicts for session-level drill-down.
     """
     alerts = []
     missed_users = []
@@ -642,6 +949,22 @@ def generate_soc_report(user_results, scores, y_true, user_ids,
             }
             if 'detection_lead_time_hours' in ur:
                 alert['detection_summary']['lead_time_hours'] = ur.get('detection_lead_time_hours')
+
+        # Session-level drill-down (if session data available)
+        if session_data is not None and timestamps is not None:
+            u_ts = timestamps[mask]
+            anomalous_mask = u_scores >= threshold
+            flagged_dates = []
+            for idx_a in np.where(anomalous_mask)[0]:
+                ts_val = u_ts[idx_a]
+                if not np.isnat(ts_val):
+                    flagged_dates.append(str(np.datetime64(ts_val, 'D')))
+            flagged_dates = sorted(set(flagged_dates))[:10]  # cap at 10 days
+
+            if flagged_dates:
+                alert['session_drilldown'] = build_session_drilldown(
+                    uid, flagged_dates, session_data, config
+                )
 
         alerts.append(alert)
 
