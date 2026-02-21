@@ -445,7 +445,7 @@ def identify_risk_indicators(model, x_cont, x_cat, config, device, top_k=3):
     x_cat_t = torch.tensor(x_cat, dtype=torch.long).to(device)
 
     with torch.no_grad():
-        predictions, mask = model(x_c, x_cat_t, mask=None)
+        predictions = model(x_c, x_cat_t)
 
     diff = (predictions - x_c).pow(2)
     per_feat_error = diff.mean(dim=(0, 1)).cpu().numpy()
