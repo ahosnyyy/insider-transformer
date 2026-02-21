@@ -1,0 +1,203 @@
+# Insider Threat Detection - Configuration
+# Daily Autoencoder Transformer on CERT R4.2
+
+# =============================================================================
+# Data Paths
+# =============================================================================
+data:
+  raw_dir: "data/raw"
+  parquet_dir: "data/parquet"
+  processed_dir: "data/processed"
+  duckdb_path: "data/processed/insider.duckdb"
+
+# =============================================================================
+# Model Architecture — Transformer Autoencoder
+# =============================================================================
+model:
+  type: "transformer_autoencoder"
+  lookback: 60                  # sequence length (number of active days)
+  min_days: 10                  # skip users with fewer active days
+  n_heads: 4
+  n_layers: 3
+  d_model: 128
+  d_ff: 256
+  dropout: 0.25
+
+# =============================================================================
+# Training
+# =============================================================================
+training:
+  loss: "mse"                   # MSE on all continuous features (full reconstruction)
+  epochs: 200
+  batch_size: 64
+  learning_rate: 0.0001
+  optimizer: "adamw"
+  weight_decay: 0.05
+  clip_grad_norm: 1.0
+  warmup_epochs: 5              # linear warmup before cosine decay
+  seed: 42                      # reproducibility
+
+# =============================================================================
+# Embedding Dimensions (for categorical features in Transformer)
+# =============================================================================
+embeddings:
+  user_id: 16
+  pc: 16
+  role: 8
+  department: 4
+  functional_unit: 4
+
+# =============================================================================
+# Feature Definitions (~45 continuous + 5 categorical)
+# =============================================================================
+features:
+  continuous:
+    # Activity counts (log1p)
+    - http_request_count
+    - unique_domains
+    - emails_sent
+    - total_attachments
+    - external_email_count
+    - unique_recipients
+    - file_copy_count
+    - exe_copy_count
+    - doc_copy_count
+    - archive_copy_count
+    - usb_connect_count
+    - usb_disconnect_count
+    - total_actions
+    # Intra-day structure
+    - num_sessions
+    - active_hours
+    - after_hours_ratio
+    - after_hours_actions
+    - peak_hour_concentration
+    # PC usage
+    - num_distinct_pcs
+    # Interaction features (log1p)
+    - file_usb_interaction
+    - external_email_attachments
+    - http_after_hours
+    - email_after_hours
+    # Personality traits (context-only, not reconstructed)
+    - openness
+    - conscientiousness
+    - extraversion
+    - agreeableness
+    - neuroticism
+
+  cyclical:
+    - day_of_week_sin
+    - day_of_week_cos
+
+  binary:
+    - is_weekend
+    - role_changed
+    - dept_changed
+    - functional_unit_changed
+    - terminated_flag
+
+  context_only:
+    - openness
+    - conscientiousness
+    - extraversion
+    - agreeableness
+    - neuroticism
+
+  categorical:
+    - user_id
+    - pc
+    - role
+    - department
+    - functional_unit
+
+  # Features to compute per-user z-scores and rolling stats for
+  user_normalized:
+    - http_request_count
+    - emails_sent
+    - file_copy_count
+    - total_actions
+
+# =============================================================================
+# Feature Encodings (fixed mappings)
+# =============================================================================
+encodings:
+  functional_unit:
+    Administration: 1
+    ResearchAndEngineering: 2
+    Manufacturing: 3
+    Finance: 4
+    SalesAndMarketing: 5
+    PurchasingAndContracts: 6
+
+# =============================================================================
+# Data Splitting
+# =============================================================================
+split:
+  train: 0.7
+  val: 0.15
+  test: 0.15
+
+# =============================================================================
+# Processing Options
+# =============================================================================
+processing:
+  normalization: "standard"     # StandardScaler (fitted on train users only)
+  log_transform: true           # log1p on skewed count features
+  sequence_stride: 5            # stride for sliding window (days)
+  per_user_sequences: true      # don't mix users across sequences
+  rolling_window: 20            # N days for rolling mean/std
+
+# =============================================================================
+# Scoring
+# =============================================================================
+scoring:
+  method: "mean_plus_max"       # 0.5 * mean_day_error + 0.5 * max_day_error
+  mean_weight: 0.5
+  max_weight: 0.5
+
+# =============================================================================
+# Test Set Augmentation (insider sequences only)
+# =============================================================================
+augmentation:
+  enabled: true                 # toggle on/off
+  insider_multiplier: 5         # generate N augmented copies per insider sequence
+  strategies:
+    jittering:
+      enabled: true
+      noise_std: 0.05           # Gaussian noise std (relative to feature std)
+    feature_dropout:
+      enabled: true
+      dropout_rate: 0.1         # randomly zero out 10% of continuous features
+    scaling:
+      enabled: true
+      scale_range: [0.9, 1.1]   # multiply continuous features by random factor
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  primary_metric: "auprc"
+  detection_level: "user"       # primary confusion matrix: user-level
+  threshold_methods:
+    - best_f1                   # threshold maximizing F1 [oracle]
+    - percentile_99             # 99th percentile of val reconstruction error
+    - percentile_95             # 95th percentile of val reconstruction error
+    - mean_plus_3std            # mean + 3×std of val reconstruction error
+    - fixed_recall_95           # threshold at 95% recall [oracle]
+    - fixed_recall_99           # threshold at 99% recall [oracle]
+  default_threshold: "best_f1"
+  metrics:
+    threshold_free:
+      - auprc
+      - auroc
+    threshold_dependent:
+      - precision
+      - recall
+      - f1
+      - fpr
+      - fnr
+    operational:
+      - detection_latency
+      - user_detection_rate
+      - per_scenario_recall

@@ -1,0 +1,100 @@
+# Data directories (root level only)
+/data/
+/data/raw/
+/data/parquet/
+/data/processed/
+/data/samples/
+
+# Output directories
+outputs/
+outputs/dry_run/
+outputs/plots/
+outputs/inference/
+outputs/visualizations/
+outputs/logs/
+*.pt
+*.pth
+*.ckpt
+
+# Documentation (if auto-generated)
+docs/
+docs/_build/
+docs/.doctrees/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+conda-meta/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+
+# DuckDB temporary files
+*.duckdb.wal
+*.duckdb.tmp
+
+# TensorBoard
+runs/
+*.tfevents.*
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Model checkpoints (already covered but explicit)
+best_model.pt
+final_model.pt
+latest_model.pt
+checkpoint_*.pt
+
+# Cache directories
+.cache/
+*.cache
+.mypy_cache/
+.ruff_cache/
