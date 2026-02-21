@@ -307,6 +307,139 @@ Run `04_evaluate.py` and compare:
 | **Scenario 2** (data theft via email) | external_email_count, total_attachments | session with external email + attachments co-occurrence |
 | **Scenario 3** (sabotage) | after_hours_actions | session entropy spike, unusual session duration patterns |
 
+### Session-Level Evaluation Metrics
+
+In addition to existing user-level and sequence-level metrics, the hybrid
+approach enables **session-level** evaluation — measuring whether the model
+can pinpoint the specific suspicious sessions within a flagged day.
+
+#### How it works
+
+1. Model flags a day as anomalous (high reconstruction error)
+2. Compute **per-feature contribution** to that day's error
+3. Map high-contribution session-derived features back to the originating session
+4. Compare flagged sessions against ground-truth insider activity timestamps
+
+#### Session-Level Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Session Precision** | Of all sessions flagged suspicious, how many overlap with actual insider activity? |
+| **Session Recall** | Of all sessions with actual insider activity, how many were flagged? |
+| **Session F1** | Harmonic mean of session precision and recall |
+| **Session Localization Accuracy** | % of flagged days where the correct session was identified as most suspicious |
+| **Mean Session Latency** | Time from insider session start to first flagged session (hours) |
+
+#### Multi-Level Metric Summary
+
+```
+Evaluation Levels:
+  ├── User-Level     (existing)  → det_rate, user precision/recall/F1
+  ├── Sequence-Level (existing)  → AUC, AUPRC, FPR, FNR, confusion matrix
+  └── Session-Level  (new)       → session precision/recall/F1, localization accuracy
+```
+
+### SOC Session-Level Incident Report
+
+Extend the existing SOC report (`soc_report.json`) to include session-level
+drill-down for each flagged user. This gives analysts the **exact session(s)**
+to investigate, not just the day.
+
+#### Report Structure
+
+```json
+{
+  "alert_id": "ALERT-2024-001",
+  "user_id": "ACM2278",
+  "risk_score": 0.87,
+  "flagged_days": [
+    {
+      "date": "2011-05-18",
+      "day_anomaly_score": 0.82,
+      "top_contributing_features": [
+        "file_usb_interaction",
+        "num_usb_sessions",
+        "short_usb_sessions"
+      ],
+      "sessions": [
+        {
+          "session_id": 14523,
+          "start": "2011-05-18T09:02:00",
+          "end": "2011-05-18T17:15:00",
+          "duration_min": 493,
+          "risk": "low",
+          "summary": "Normal work session, 120 HTTP requests, 8 emails"
+        },
+        {
+          "session_id": 14524,
+          "start": "2011-05-18T22:45:00",
+          "end": "2011-05-18T23:12:00",
+          "duration_min": 27,
+          "risk": "high",
+          "summary": "After-hours session: 15 file copies to USB, 3 .exe files",
+          "indicators": [
+            "After-hours USB session (22:45)",
+            "Executable files copied to removable media",
+            "Short session with high file activity (burst_score=0.89)"
+          ],
+          "events": [
+            {"time": "22:46:00", "type": "device", "detail": "USB connect"},
+            {"time": "22:47:00", "type": "file", "detail": "copy project_specs.docx to E:\\"},
+            {"time": "22:48:00", "type": "file", "detail": "copy deploy_tool.exe to E:\\"},
+            {"time": "22:50:00", "type": "file", "detail": "copy client_db.zip to E:\\"},
+            {"time": "23:10:00", "type": "device", "detail": "USB disconnect"},
+            {"time": "23:12:00", "type": "logon", "detail": "Logoff"}
+          ]
+        }
+      ]
+    }
+  ],
+  "recommendation": "Investigate session #14524 — after-hours USB data exfiltration pattern",
+  "confidence": "high"
+}
+```
+
+#### SOC Workflow Integration
+
+```
+Model flags user → SOC report generated
+    │
+    ▼
+Analyst opens report
+    │
+    ▼
+Sees flagged DAY with anomaly score
+    │
+    ▼
+Drills into flagged SESSION(s) within that day
+    │
+    ▼
+Sees raw events within the session
+    │
+    ▼
+Takes action (escalate / dismiss / monitor)
+```
+
+#### Key Benefits for SOC
+
+| Benefit | Without Sessions | With Sessions |
+|---------|-----------------|---------------|
+| **Alert context** | "User X was anomalous on May 18" | "User X had a suspicious 27-min USB session at 10:45pm on May 18" |
+| **Investigation time** | Analyst reviews full day of logs | Analyst reviews 1 session, 6 events |
+| **False alarm triage** | Hard to dismiss — need to check everything | Easy — "the flagged session was a scheduled backup" |
+| **Evidence for escalation** | Vague daily stats | Specific events with timestamps |
+| **Mean time to respond** | Hours (manual log review) | Minutes (session pre-filtered) |
+
+#### Implementation
+
+| Component | Change |
+|-----------|--------|
+| `src/evaluation/helpers.py` | Add `compute_session_metrics()` function |
+| `src/evaluation/helpers.py` | Extend `generate_soc_report()` with session drill-down |
+| `scripts/04_evaluate.py` | Add session-level metrics to evaluation output |
+| `scripts/04_evaluate.py` | Pass session table to SOC report generator |
+| DuckDB `sessions` table | Preserved through evaluation (not dropped after feature engineering) |
+
 ---
 
 ## 9. Risks and Mitigations
@@ -344,6 +477,8 @@ Run `04_evaluate.py` and compare:
 | Per-session feature extraction | 1 day |
 | Daily aggregation integration | 0.5 day |
 | Config + pipeline testing | 0.5 day |
+| Session-level evaluation metrics | 1 day |
+| SOC session-level report extension | 1 day |
 | Retraining + evaluation | 1 day |
-| Comparison analysis | 0.5 day |
-| **Total** | **~5 days** |
+| Comparison analysis (all 3 levels) | 0.5 day |
+| **Total** | **~7 days** |
