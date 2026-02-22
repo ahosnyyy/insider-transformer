@@ -828,9 +828,7 @@ def _persist_sessions(conn, db_path):
     conn.execute(f"ATTACH '{db_path}' AS src")
 
     # Drop existing sessions table if present
-    src_tables = [r[0] for r in conn.execute("SHOW TABLES IN src").fetchall()]
-    if 'sessions' in src_tables:
-        conn.execute("DROP TABLE src.sessions")
+    conn.execute("DROP TABLE IF EXISTS src.sessions")
 
     conn.execute("""
         CREATE TABLE src.sessions AS

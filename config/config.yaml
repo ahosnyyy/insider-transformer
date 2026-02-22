@@ -17,11 +17,11 @@ model:
   type: "transformer_autoencoder"
   lookback: 60                  # sequence length (number of active days)
   min_days: 10                  # skip users with fewer active days
-  n_heads: 4
-  n_layers: 3
-  d_model: 128
-  d_ff: 256
-  dropout: 0.25
+  n_heads: 6
+  n_layers: 4
+  d_model: 192
+  d_ff: 512
+  dropout: 0.2
 
 # =============================================================================
 # Training

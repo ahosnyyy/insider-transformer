@@ -129,7 +129,12 @@ def main():
         X_test_cont = np.load(data_dir / 'X_test_continuous_aug.npy')
         X_test_cat = np.load(data_dir / 'X_test_categorical_aug.npy')
         y_test = np.load(data_dir / 'y_test_aug.npy')
-        user_ids_test = np.load(data_dir / 'user_ids_test.npy', allow_pickle=True)
+        uid_aug_path = data_dir / 'user_ids_test_aug.npy'
+        if uid_aug_path.exists():
+            user_ids_test = np.load(uid_aug_path, allow_pickle=True)
+        else:
+            user_ids_test = np.load(data_dir / 'user_ids_test.npy', allow_pickle=True)
+            print("  WARNING: user_ids_test_aug.npy not found, re-run augmentation")
     else:
         X_test_cont = np.load(data_dir / 'X_test_continuous.npy')
         X_test_cat = np.load(data_dir / 'X_test_categorical.npy')
