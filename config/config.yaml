@@ -17,11 +17,11 @@ model:
   type: "transformer_autoencoder"
   lookback: 60                  # sequence length (number of active days)
   min_days: 10                  # skip users with fewer active days
-  n_heads: 4
-  n_layers: 3
-  d_model: 128
-  d_ff: 256
-  dropout: 0.25
+  n_heads: 6
+  n_layers: 4
+  d_model: 192
+  d_ff: 512
+  dropout: 0.2
 
 # =============================================================================
 # Training
@@ -48,7 +48,7 @@ embeddings:
   functional_unit: 4
 
 # =============================================================================
-# Feature Definitions (~45 continuous + 5 categorical)
+# Feature Definitions (~65 continuous + 5 categorical)
 # =============================================================================
 features:
   continuous:
@@ -74,17 +74,41 @@ features:
     - peak_hour_concentration
     # PC usage
     - num_distinct_pcs
-    # Interaction features (log1p)
-    - file_usb_interaction
-    - external_email_attachments
-    - http_after_hours
-    - email_after_hours
     # Personality traits (context-only, not reconstructed)
     - openness
     - conscientiousness
     - extraversion
     - agreeableness
     - neuroticism
+
+  interaction:
+    # Interaction features (log1p)
+    - file_usb_interaction
+    - external_email_attachments
+    - http_after_hours
+    - email_after_hours
+
+  session:
+    # Session-derived features (log1p on counts, raw on ratios/stats)
+    - sess_count
+    - mean_session_duration
+    - max_session_duration
+    - std_session_duration
+    - total_session_time
+    - num_after_hours_sessions
+    - after_hours_session_ratio
+    - earliest_session_hour
+    - latest_session_hour
+    - session_hour_spread
+    - mean_session_event_count
+    - max_session_event_count
+    - mean_session_entropy
+    - num_usb_sessions
+    - num_exe_sessions
+    - longest_inter_session_gap
+    - usb_after_hours_sessions
+    - file_heavy_sessions
+    - short_usb_sessions
 
   cyclical:
     - day_of_week_sin
@@ -117,6 +141,9 @@ features:
     - emails_sent
     - file_copy_count
     - total_actions
+    - sess_count
+    - mean_session_duration
+    - total_session_time
 
 # =============================================================================
 # Feature Encodings (fixed mappings)

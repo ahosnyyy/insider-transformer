@@ -13,6 +13,7 @@ Plots (all derived from saved outputs — no model loading required):
   7. Per-scenario breakdown
   8. Anomaly score scatter
   9. Confusion matrix (best_f1 threshold)
+  9.5. Session-level confusion matrix
 
 Usage:
     python scripts/05_plot.py
@@ -563,6 +564,62 @@ def plot_confusion_matrix(eval_results: dict, plots_dir: Path):
     print(f"  Saved: confusion_matrix.png")
 
 
+def plot_session_confusion_matrix(eval_results: dict, plots_dir: Path):
+    """Plot session-level confusion matrix from session_level_metrics."""
+    session_metrics = eval_results.get('session_level_metrics')
+    if not session_metrics:
+        print("  [skip] No session_level_metrics available")
+        return
+
+    # Extract counts from session metrics
+    total_insider = session_metrics.get('total_insider_sessions', 0)
+    flagged_insider = session_metrics.get('flagged_insider_sessions', 0)
+    total_flagged = session_metrics.get('total_flagged_sessions', 0)
+
+    # Compute confusion matrix
+    tp = flagged_insider
+    fp = total_flagged - flagged_insider
+    fn = total_insider - flagged_insider
+    tn = 0  # Not directly available — sessions are only evaluated during insider period
+
+    # Since TN is not available (we only evaluate sessions during insider period),
+    # we'll plot with available counts and note the limitation
+    cm = np.array([[tp, fn], [fp, tn]])
+    labels = ['Insider Session', 'Normal Session']
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    
+    # Use seaborn heatmap
+    sns.heatmap(cm, annot=True, fmt=',d', cmap='Greens', ax=ax,
+                xticklabels=labels, yticklabels=labels,
+                cbar_kws={'label': 'Count'}, linewidths=2, linecolor='gray')
+    
+    # Add quadrant labels
+    quadrant_labels = [['TP', 'FN'], ['FP', 'TN (N/A)']]
+    for i in range(2):
+        for j in range(2):
+            ax.text(j + 0.5, i + 0.7, quadrant_labels[i][j], ha='center', va='center',
+                    fontsize=10, color='gray', fontweight='bold')
+
+    ax.set_xlabel('Predicted', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Actual', fontsize=12, fontweight='bold')
+    ax.set_title("Session-Level Confusion Matrix\n(Insider period sessions only)", 
+                 fontsize=13, fontweight='bold', pad=15)
+    
+    # Add metrics text
+    precision = session_metrics.get('session_precision', 0)
+    recall = session_metrics.get('session_recall', 0)
+    f1 = session_metrics.get('session_f1', 0)
+    text = f"Precision: {precision:.3f}\nRecall: {recall:.3f}\nF1: {f1:.3f}"
+    ax.text(1.15, 0.5, text, transform=ax.transAxes, fontsize=10,
+            va='center', ha='left', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    fig.tight_layout()
+    fig.savefig(plots_dir / 'confusion_matrix_session.png', dpi=DPI)
+    plt.close(fig)
+    print(f"  Saved: confusion_matrix_session.png")
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -682,6 +739,11 @@ def main():
     print("[9/10] Confusion matrix...")
     if eval_results:
         plot_confusion_matrix(eval_results, plots_dir)
+        plot_count += 1
+
+    print("[9.5/10] Session-level confusion matrix...")
+    if eval_results:
+        plot_session_confusion_matrix(eval_results, plots_dir)
         plot_count += 1
 
     print("[10/10] Detection timeline...")

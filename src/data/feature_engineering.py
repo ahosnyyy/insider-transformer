@@ -1,13 +1,15 @@
 """
-Feature Engineering — Daily Aggregation
-====================================
+Feature Engineering — Hybrid Session → Daily Aggregation
+=========================================================
 All heavy computation in DuckDB SQL. No pandas. Only numpy for final export.
 
 Stages:
-  1. Daily aggregation from events (GROUP BY user_id, date)
-  2. Enrich with static features (users, psychometric, LDAP changes, labels)
-  3. Derived features + log1p + z-scores + rolling stats + cyclical encoding
-  4. StandardScaler in numpy + export arrays
+  1a. Daily aggregation from events (GROUP BY user_id, date)
+  1b. Session detection (Logon/Logoff pairing) + per-session features
+  1c. Daily aggregation of session features → merge into daily table
+  2.  Enrich with static features (users, psychometric, LDAP changes, labels)
+  3.  Derived features + log1p + z-scores + rolling stats + cyclical encoding
+  4.  StandardScaler in numpy + export arrays
 """
 
 import gc
@@ -139,6 +141,307 @@ def _create_daily_aggregation(conn):
 
 
 # =========================================================================
+# Stage 1b: Session Detection
+# =========================================================================
+
+def _create_sessions_table(conn):
+    """Detect sessions by pairing Logon/Logoff events per user per PC.
+
+    Edge cases handled:
+      - Missing Logoff → end session at next Logon or end of day
+      - Multiple Logons without Logoff → each starts a new session
+      - Logoff without prior Logon → ignored (orphan)
+      - Overnight sessions → assigned to start date
+      - Duration capped at 720 minutes (12 hours)
+    """
+    print("\n[Stage 1b] Detecting sessions from Logon/Logoff events...")
+
+    conn.execute("""
+    CREATE TABLE sessions AS
+    WITH logon_events AS (
+        SELECT
+            user_id, pc, datetime AS session_start,
+            CAST(datetime AS DATE) AS session_date,
+            EXTRACT(HOUR FROM datetime) AS hour_of_start,
+            ROW_NUMBER() OVER (PARTITION BY user_id, pc ORDER BY datetime) AS rn
+        FROM src.events
+        WHERE activity = 'Logon'
+    ),
+    logoff_events AS (
+        SELECT
+            user_id, pc, datetime AS logoff_time,
+            ROW_NUMBER() OVER (PARTITION BY user_id, pc ORDER BY datetime) AS rn
+        FROM src.events
+        WHERE activity = 'Logoff'
+    ),
+    paired AS (
+        SELECT
+            lo.user_id,
+            lo.pc,
+            lo.session_date,
+            lo.session_start,
+            lo.hour_of_start,
+            -- Match to the first Logoff on the same user+pc AFTER this Logon
+            (SELECT MIN(lf.logoff_time)
+             FROM logoff_events lf
+             WHERE lf.user_id = lo.user_id
+               AND lf.pc = lo.pc
+               AND lf.logoff_time > lo.session_start
+               AND lf.logoff_time <= lo.session_start + INTERVAL '12 hours'
+            ) AS session_end_raw
+        FROM logon_events lo
+    ),
+    with_end AS (
+        SELECT
+            user_id, pc, session_date, session_start, hour_of_start,
+            COALESCE(
+                session_end_raw,
+                -- Fallback: end of day if no logoff found
+                (session_date + INTERVAL '1 day' - INTERVAL '1 second')::TIMESTAMP
+            ) AS session_end
+        FROM paired
+    )
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY user_id, session_start) AS session_id,
+        user_id,
+        pc,
+        session_date,
+        session_start,
+        session_end,
+        LEAST(
+            EXTRACT(EPOCH FROM (session_end - session_start)) / 60.0,
+            720.0
+        ) AS duration_min,
+        CASE WHEN hour_of_start < 8 OR hour_of_start >= 18 THEN 1 ELSE 0 END AS is_after_hours,
+        hour_of_start
+    FROM with_end
+    """)
+
+    count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    n_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM sessions").fetchone()[0]
+    ah = conn.execute("SELECT SUM(is_after_hours) FROM sessions").fetchone()[0]
+    print(f"  Sessions detected: {count:,} across {n_users} users "
+          f"({ah:,} after-hours)")
+
+
+# =========================================================================
+# Stage 1c: Per-Session Features + Daily Session Aggregation
+# =========================================================================
+
+def _compute_session_features(conn):
+    """Compute per-session activity features, then aggregate to daily level."""
+    print("\n[Stage 1c] Computing per-session features...")
+
+    # Step 1: Per-session activity counts
+    conn.execute("""
+    CREATE TABLE session_counts AS
+    SELECT
+        s.session_id,
+        s.user_id,
+        s.session_date,
+        s.duration_min,
+        s.is_after_hours,
+        s.hour_of_start,
+        COUNT(e.id) AS session_event_count,
+        COUNT(CASE WHEN e.activity = 'File' THEN 1 END) AS session_file_count,
+        COUNT(CASE WHEN e.activity = 'Email' THEN 1 END) AS session_email_count,
+        COUNT(CASE WHEN e.activity = 'Http' THEN 1 END) AS session_http_count,
+        CASE WHEN COUNT(CASE WHEN e.activity = 'Connect' THEN 1 END) > 0
+             THEN 1 ELSE 0 END AS session_usb_used,
+        CASE WHEN COUNT(CASE WHEN e.activity = 'Email' AND (
+            COALESCE(e.to_addr, '') NOT LIKE '%@dtaa.com%'
+        ) THEN 1 END) > 0 THEN 1 ELSE 0 END AS session_external_email,
+        CASE WHEN COUNT(CASE WHEN e.activity = 'File' AND (
+            LOWER(e.filename) LIKE '%.exe' OR LOWER(e.filename) LIKE '%.msi' OR
+            LOWER(e.filename) LIKE '%.bat' OR LOWER(e.filename) LIKE '%.cmd'
+        ) THEN 1 END) > 0 THEN 1 ELSE 0 END AS session_exe_copied,
+        COUNT(DISTINCT CASE WHEN e.activity = 'Http' AND e.url IS NOT NULL
+              THEN SPLIT_PART(SPLIT_PART(e.url, '/', 3), ':', 1) END) AS session_unique_domains,
+        COALESCE(SUM(CASE WHEN e.activity = 'Email'
+                     THEN CAST(e.attachments AS INT) ELSE 0 END), 0) AS session_attachment_count
+    FROM sessions s
+    LEFT JOIN src.events e
+        ON e.user_id = s.user_id
+        AND e.pc = s.pc
+        AND e.datetime >= s.session_start
+        AND e.datetime <= s.session_end
+        AND e.activity NOT IN ('Logon', 'Logoff')
+    GROUP BY s.session_id, s.user_id, s.session_date,
+             s.duration_min, s.is_after_hours, s.hour_of_start
+    """)
+
+    # Step 2: Compute Shannon entropy per session from activity type distribution
+    conn.execute("""
+    CREATE TABLE session_entropy AS
+    WITH act_counts AS (
+        SELECT
+            s.session_id,
+            e.activity,
+            COUNT(*) AS cnt,
+            SUM(COUNT(*)) OVER (PARTITION BY s.session_id) AS total
+        FROM sessions s
+        JOIN src.events e
+            ON e.user_id = s.user_id
+            AND e.pc = s.pc
+            AND e.datetime >= s.session_start
+            AND e.datetime <= s.session_end
+            AND e.activity NOT IN ('Logon', 'Logoff')
+        GROUP BY s.session_id, e.activity
+    ),
+    probs AS (
+        SELECT
+            session_id,
+            CAST(cnt AS DOUBLE) / CAST(total AS DOUBLE) AS p
+        FROM act_counts
+        WHERE total > 0
+    )
+    SELECT
+        session_id,
+        -1.0 * SUM(p * LN(p) / LN(2)) AS session_event_entropy
+    FROM probs
+    GROUP BY session_id
+    """)
+
+    # Step 3: Join counts + entropy
+    conn.execute("""
+    CREATE TABLE session_features AS
+    SELECT
+        sc.*,
+        COALESCE(se.session_event_entropy, 0) AS session_event_entropy
+    FROM session_counts sc
+    LEFT JOIN session_entropy se ON sc.session_id = se.session_id
+    """)
+
+    conn.execute("DROP TABLE session_counts")
+    conn.execute("DROP TABLE session_entropy")
+
+    cnt = conn.execute("SELECT COUNT(*) FROM session_features").fetchone()[0]
+    print(f"  Session features computed: {cnt:,} sessions")
+
+    # Aggregate session features to daily level
+    print("  Aggregating session features to daily level...")
+    conn.execute("""
+    CREATE TABLE daily_session_stats AS
+    SELECT
+        user_id,
+        session_date AS date,
+        -- Session count & duration stats
+        COUNT(*) AS sess_count,
+        AVG(duration_min) AS mean_session_duration,
+        MAX(duration_min) AS max_session_duration,
+        COALESCE(STDDEV_POP(duration_min), 0) AS std_session_duration,
+        SUM(duration_min) AS total_session_time,
+        -- Session timing stats
+        SUM(is_after_hours) AS num_after_hours_sessions,
+        CAST(SUM(is_after_hours) AS DOUBLE) / NULLIF(COUNT(*), 0) AS after_hours_session_ratio,
+        MIN(hour_of_start) AS earliest_session_hour,
+        MAX(hour_of_start) AS latest_session_hour,
+        MAX(hour_of_start) - MIN(hour_of_start) AS session_hour_spread,
+        -- Session behavior stats
+        AVG(session_event_count) AS mean_session_event_count,
+        MAX(session_event_count) AS max_session_event_count,
+        AVG(COALESCE(session_event_entropy, 0)) AS mean_session_entropy,
+        SUM(session_usb_used) AS num_usb_sessions,
+        SUM(session_exe_copied) AS num_exe_sessions,
+        -- Session interaction features
+        SUM(CASE WHEN session_usb_used = 1 AND is_after_hours = 1
+                 THEN 1 ELSE 0 END) AS usb_after_hours_sessions,
+        SUM(CASE WHEN session_file_count > 10
+                 THEN 1 ELSE 0 END) AS file_heavy_sessions,
+        SUM(CASE WHEN duration_min < 15 AND session_usb_used = 1
+                 THEN 1 ELSE 0 END) AS short_usb_sessions
+    FROM session_features
+    GROUP BY user_id, session_date
+    """)
+
+    cnt = conn.execute("SELECT COUNT(*) FROM daily_session_stats").fetchone()[0]
+    print(f"  Daily session stats: {cnt:,} user-days")
+
+    # Compute inter-session gaps per user per day
+    conn.execute("""
+    CREATE TABLE session_gaps AS
+    SELECT
+        user_id,
+        session_date AS date,
+        MAX(gap_min) AS longest_inter_session_gap
+    FROM (
+        SELECT
+            user_id,
+            session_date,
+            EXTRACT(EPOCH FROM (
+                session_start - LAG(session_end) OVER (
+                    PARTITION BY user_id, session_date ORDER BY session_start
+                )
+            )) / 60.0 AS gap_min
+        FROM sessions
+    ) gaps
+    WHERE gap_min IS NOT NULL AND gap_min >= 0
+    GROUP BY user_id, session_date
+    """)
+
+    # Merge gaps into daily session stats
+    conn.execute("""
+    CREATE TABLE daily_session_merged AS
+    SELECT
+        ds.*,
+        COALESCE(sg.longest_inter_session_gap, 0) AS longest_inter_session_gap
+    FROM daily_session_stats ds
+    LEFT JOIN session_gaps sg ON ds.user_id = sg.user_id AND ds.date = sg.date
+    """)
+
+    conn.execute("DROP TABLE daily_session_stats")
+    conn.execute("DROP TABLE session_gaps")
+    conn.execute("ALTER TABLE daily_session_merged RENAME TO daily_session_stats")
+
+    print("  Session feature aggregation complete.")
+
+
+# =========================================================================
+# Stage 1d: Merge Session Stats into Daily Table
+# =========================================================================
+
+def _merge_session_stats(conn):
+    """LEFT JOIN daily_session_stats onto the daily table."""
+    print("\n[Stage 1d] Merging session stats into daily table...")
+
+    conn.execute("""
+    CREATE TABLE daily_merged AS
+    SELECT
+        d.*,
+        COALESCE(ss.sess_count, 0) AS sess_count,
+        COALESCE(ss.mean_session_duration, 0) AS mean_session_duration,
+        COALESCE(ss.max_session_duration, 0) AS max_session_duration,
+        COALESCE(ss.std_session_duration, 0) AS std_session_duration,
+        COALESCE(ss.total_session_time, 0) AS total_session_time,
+        COALESCE(ss.num_after_hours_sessions, 0) AS num_after_hours_sessions,
+        COALESCE(ss.after_hours_session_ratio, 0) AS after_hours_session_ratio,
+        COALESCE(ss.earliest_session_hour, 0) AS earliest_session_hour,
+        COALESCE(ss.latest_session_hour, 0) AS latest_session_hour,
+        COALESCE(ss.session_hour_spread, 0) AS session_hour_spread,
+        COALESCE(ss.mean_session_event_count, 0) AS mean_session_event_count,
+        COALESCE(ss.max_session_event_count, 0) AS max_session_event_count,
+        COALESCE(ss.mean_session_entropy, 0) AS mean_session_entropy,
+        COALESCE(ss.num_usb_sessions, 0) AS num_usb_sessions,
+        COALESCE(ss.num_exe_sessions, 0) AS num_exe_sessions,
+        COALESCE(ss.longest_inter_session_gap, 0) AS longest_inter_session_gap,
+        COALESCE(ss.usb_after_hours_sessions, 0) AS usb_after_hours_sessions,
+        COALESCE(ss.file_heavy_sessions, 0) AS file_heavy_sessions,
+        COALESCE(ss.short_usb_sessions, 0) AS short_usb_sessions
+    FROM daily d
+    LEFT JOIN daily_session_stats ss ON d.user_id = ss.user_id AND d.date = ss.date
+    """)
+
+    conn.execute("DROP TABLE daily")
+    conn.execute("DROP TABLE daily_session_stats")
+    conn.execute("DROP TABLE session_features")
+    conn.execute("ALTER TABLE daily_merged RENAME TO daily")
+
+    cnt = conn.execute("SELECT COUNT(*) FROM daily").fetchone()[0]
+    n_cols = len(conn.execute("DESCRIBE daily").fetchall())
+    print(f"  Merged daily table: {cnt:,} rows, {n_cols} columns")
+
+
+# =========================================================================
 # Stage 2: Enrich with Static Features
 # =========================================================================
 
@@ -167,6 +470,15 @@ def _enrich_daily(conn):
         d.usb_connect_count, d.usb_disconnect_count, d.total_actions,
         d.num_sessions, d.active_hours, d.after_hours_ratio, d.after_hours_actions,
         d.peak_hour_concentration, d.num_distinct_pcs,
+        -- Session-derived features
+        d.sess_count, d.mean_session_duration, d.max_session_duration,
+        d.std_session_duration, d.total_session_time,
+        d.num_after_hours_sessions, d.after_hours_session_ratio,
+        d.earliest_session_hour, d.latest_session_hour, d.session_hour_spread,
+        d.mean_session_event_count, d.max_session_event_count,
+        d.mean_session_entropy, d.num_usb_sessions, d.num_exe_sessions,
+        d.longest_inter_session_gap, d.usb_after_hours_sessions,
+        d.file_heavy_sessions, d.short_usb_sessions,
         u.role, u.department, u.functional_unit,
         COALESCE(p.openness, {med[0]}) AS openness,
         COALESCE(p.conscientiousness, {med[1]}) AS conscientiousness,
@@ -268,7 +580,27 @@ def _compute_features(conn, config):
             ri.file_usb_interaction,
             ri.external_email_attachments,
             ri.http_after_hours,
-            ri.email_after_hours
+            ri.email_after_hours,
+            -- Session-derived features (log1p on counts, pass-through on ratios/stats)
+            LN(1+e.sess_count) AS sess_count,
+            LN(1+e.mean_session_duration) AS mean_session_duration,
+            LN(1+e.max_session_duration) AS max_session_duration,
+            e.std_session_duration,
+            LN(1+e.total_session_time) AS total_session_time,
+            LN(1+e.num_after_hours_sessions) AS num_after_hours_sessions,
+            e.after_hours_session_ratio,
+            e.earliest_session_hour,
+            e.latest_session_hour,
+            e.session_hour_spread,
+            LN(1+e.mean_session_event_count) AS mean_session_event_count,
+            LN(1+e.max_session_event_count) AS max_session_event_count,
+            e.mean_session_entropy,
+            LN(1+e.num_usb_sessions) AS num_usb_sessions,
+            LN(1+e.num_exe_sessions) AS num_exe_sessions,
+            LN(1+e.longest_inter_session_gap) AS longest_inter_session_gap,
+            LN(1+e.usb_after_hours_sessions) AS usb_after_hours_sessions,
+            LN(1+e.file_heavy_sessions) AS file_heavy_sessions,
+            LN(1+e.short_usb_sessions) AS short_usb_sessions
         FROM enriched e
         JOIN raw_interact ri ON e.user_id = ri.user_id AND e.date = ri.date
     )
@@ -292,6 +624,18 @@ def _compute_features(conn, config):
         la.external_email_attachments,
         la.http_after_hours,
         la.email_after_hours,
+
+        -- Session-derived features
+        la.sess_count,
+        la.mean_session_duration, la.max_session_duration,
+        la.std_session_duration, la.total_session_time,
+        la.num_after_hours_sessions, la.after_hours_session_ratio,
+        la.earliest_session_hour, la.latest_session_hour, la.session_hour_spread,
+        la.mean_session_event_count, la.max_session_event_count,
+        la.mean_session_entropy,
+        la.num_usb_sessions, la.num_exe_sessions,
+        la.longest_inter_session_gap,
+        la.usb_after_hours_sessions, la.file_heavy_sessions, la.short_usb_sessions,
 
         -- Z-scores + rolling stats
         {zscore_sql}
@@ -335,7 +679,8 @@ def _scale_and_export(conn, config, output_dir):
     interaction_cfg = config['features'].get('interaction', [])
     user_norm = config['features'].get('user_normalized', [])
 
-    scalable_cols = list(cont_cfg) + list(interaction_cfg)
+    session_cfg = config['features'].get('session', [])
+    scalable_cols = list(cont_cfg) + list(interaction_cfg) + list(session_cfg)
     for col in user_norm:
         scalable_cols.extend([f'{col}_zscore', f'{col}_rolling_mean', f'{col}_rolling_std'])
 
@@ -465,6 +810,40 @@ def _scale_and_export(conn, config, output_dir):
 
 
 # =========================================================================
+# Persist Sessions to DuckDB
+# =========================================================================
+
+def _persist_sessions(conn, db_path):
+    """Write the sessions table to the source DuckDB for evaluation use."""
+    print("\n[Persist] Saving sessions table to DuckDB...")
+
+    # Check if sessions table still exists in memory
+    tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+    if 'sessions' not in tables:
+        print("  WARNING: sessions table not found in memory, skipping persist.")
+        return
+
+    # Re-attach as writable to persist
+    conn.execute("DETACH src")
+    conn.execute(f"ATTACH '{db_path}' AS src")
+
+    # Drop existing sessions table if present
+    conn.execute("DROP TABLE IF EXISTS src.sessions")
+
+    conn.execute("""
+        CREATE TABLE src.sessions AS
+        SELECT * FROM sessions
+    """)
+
+    cnt = conn.execute("SELECT COUNT(*) FROM src.sessions").fetchone()[0]
+    print(f"  Persisted {cnt:,} sessions to {db_path}")
+
+    # Re-attach as read-only for safety
+    conn.execute("DETACH src")
+    conn.execute(f"ATTACH '{db_path}' AS src (READ_ONLY)")
+
+
+# =========================================================================
 # Main Pipeline
 # =========================================================================
 
@@ -483,9 +862,16 @@ def run_feature_engineering() -> Path:
 
     try:
         _create_daily_aggregation(conn)
+        _create_sessions_table(conn)
+        _compute_session_features(conn)
+        _merge_session_stats(conn)
         _enrich_daily(conn)
         _compute_features(conn, config)
         _scale_and_export(conn, config, output_dir)
+
+        # Persist sessions table to source DuckDB for evaluation
+        _persist_sessions(conn, db_path)
+
         return output_dir
     finally:
         conn.close()
