@@ -66,7 +66,7 @@ class Evaluator:
         batch_size: Batch size for scoring
         threshold_method: Which threshold(s) to evaluate ('all' or specific method)
         load_scores: Load cached scores instead of re-scoring
-        use_augmented: Use augmented test set
+        no_augment: Skip augmented test set (use original data)
         exclude_scenarios: Scenario numbers to exclude
         use_amp: Enable mixed precision scoring
         dry_run: Use dry run checkpoints
@@ -80,7 +80,7 @@ class Evaluator:
         batch_size: int = 256,
         threshold_method: str = 'all',
         load_scores: bool = False,
-        use_augmented: bool = False,
+        no_augment: bool = False,
         exclude_scenarios: Optional[List[int]] = None,
         use_amp: bool = False,
         dry_run: bool = False,
@@ -91,7 +91,7 @@ class Evaluator:
         self.batch_size = batch_size
         self.threshold_method = threshold_method
         self.load_scores = load_scores
-        self.use_augmented = use_augmented
+        self.no_augment = no_augment
         self.exclude_scenarios = exclude_scenarios
         self.use_amp = use_amp
         self.dry_run = dry_run
@@ -134,7 +134,7 @@ class Evaluator:
         # Load test data + scenario mapping
         # --------------------------------------------------------------
         print(f"\n{step.next('Loading test data...')}")
-        if self.use_augmented:
+        if not self.no_augment:
             print("  Using augmented test set")
             X_test_cont = np.load(self.data_dir / 'X_test_continuous_aug.npy')
             X_test_cat = np.load(self.data_dir / 'X_test_categorical_aug.npy')
@@ -160,7 +160,7 @@ class Evaluator:
         else:
             print("  Session data not available (session-level metrics will be skipped)")
 
-        ts_name = 'dates_test_aug.npy' if self.use_augmented else 'dates_test.npy'
+        ts_name = 'dates_test_aug.npy' if not self.no_augment else 'dates_test.npy'
         ts_path = self.data_dir / ts_name
         timestamps_test = None
         if ts_path.exists():
@@ -386,7 +386,7 @@ class Evaluator:
             'detection_latency_summary': latency_summary,
             'session_level_metrics': session_metrics_result,
             'excluded_scenarios': self.exclude_scenarios,
-            'use_augmented': self.use_augmented,
+            'no_augment': self.no_augment,
             'evaluation_time_seconds': round(elapsed, 1),
         }
 

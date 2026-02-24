@@ -644,7 +644,7 @@ class Plotter:
 
     Args:
         config: Configuration dictionary (from config.yaml)
-        use_augmented: Use augmented test labels
+        no_augment: Skip augmented test labels (use original data)
         dry_run: Plot from dry-run outputs
         output_dir: Override output directory
         data_dir: Override data directory
@@ -653,13 +653,13 @@ class Plotter:
     def __init__(
         self,
         config: dict,
-        use_augmented: bool = False,
+        no_augment: bool = False,
         dry_run: bool = False,
         output_dir: Optional[Path] = None,
         data_dir: Optional[Path] = None,
     ):
         self.config = config
-        self.use_augmented = use_augmented
+        self.no_augment = no_augment
         self.dry_run = dry_run
 
         project_root = Path(__file__).parent.parent.parent
@@ -709,7 +709,7 @@ class Plotter:
             print("  [warn] test_anomaly_scores.npy not found — score plots skipped")
 
         y = None
-        label_name = 'y_test_aug.npy' if self.use_augmented else 'y_test.npy'
+        label_name = 'y_test_aug.npy' if not self.no_augment else 'y_test.npy'
         label_path = self.data_dir / label_name
         if label_path.exists():
             y = np.load(label_path)
@@ -719,7 +719,7 @@ class Plotter:
 
         # Auto-detect label mismatch
         if scores is not None and y is not None and len(scores) != len(y):
-            alt_name = 'y_test_aug.npy' if not self.use_augmented else 'y_test.npy'
+            alt_name = 'y_test_aug.npy' if self.no_augment else 'y_test.npy'
             alt_path = self.data_dir / alt_name
             if alt_path.exists():
                 y_alt = np.load(alt_path)

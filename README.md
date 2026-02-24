@@ -226,10 +226,10 @@ outputs/
 Comprehensive evaluation with multi-level metrics (user, sequence, session) and SOC report generation.
 
 ```bash
-python scripts/04_evaluate.py                                    # Default (AMP disabled)
+python scripts/04_evaluate.py                                    # Default: augmented test set
 
-# Use augmented test set
-python scripts/04_evaluate.py --use-augmented
+# Use original (non-augmented) test set
+python scripts/04_evaluate.py --no-augment
 
 # Enable mixed precision for faster evaluation
 python scripts/04_evaluate.py --amp
@@ -278,10 +278,10 @@ outputs/
 Generate publication-quality plots from saved outputs. No model loading required. All plots use **seaborn** styling for professional, consistent visualizations with automatic legend positioning.
 
 ```bash
-python scripts/05_plot.py
+python scripts/05_plot.py                                        # Default: augmented test labels
 
-# Use augmented test labels
-python scripts/05_plot.py --use-augmented
+# Use original (non-augmented) test labels
+python scripts/05_plot.py --no-augment
 
 # Plot from dry run outputs
 python scripts/05_plot.py --dry-run

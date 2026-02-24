@@ -4,11 +4,11 @@
 Thin CLI wrapper around src/evaluation/evaluator.py.
 
 Usage:
-    python scripts/04_evaluate.py                              # Default
+    python scripts/04_evaluate.py                              # Default: augmented test set
     python scripts/04_evaluate.py --amp                        # Enable AMP
     python scripts/04_evaluate.py --threshold best_f1
     python scripts/04_evaluate.py --load-scores                # Skip re-scoring
-    python scripts/04_evaluate.py --use-augmented              # Augmented test set
+    python scripts/04_evaluate.py --no-augment                  # Use original test set
     python scripts/04_evaluate.py --exclude-scenarios 3        # Exclude scenario
     python scripts/04_evaluate.py --dry-run                    # Dry-run checkpoints
 """
@@ -32,8 +32,8 @@ def parse_args():
                         help='Load cached scores instead of re-scoring')
     parser.add_argument('--exclude-scenarios', type=int, nargs='+', default=None,
                         help='Scenario numbers to exclude (e.g. --exclude-scenarios 3)')
-    parser.add_argument('--use-augmented', action='store_true',
-                        help='Use augmented test set instead of original')
+    parser.add_argument('--no-augment', action='store_true',
+                        help='Use original test set instead of augmented (default: use augmented)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Evaluate using dry run checkpoints (outputs/dry_run/)')
     parser.add_argument('--amp', action='store_true',
@@ -50,7 +50,7 @@ def main():
         batch_size=args.batch_size,
         threshold_method=args.threshold,
         load_scores=args.load_scores,
-        use_augmented=args.use_augmented,
+        no_augment=args.no_augment,
         exclude_scenarios=args.exclude_scenarios,
         use_amp=args.amp,
         dry_run=args.dry_run,
