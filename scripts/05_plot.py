@@ -686,73 +686,90 @@ def main():
     else:
         print(f"  [warn] {label_name} not found — label-dependent plots skipped")
 
+    # Auto-detect: if scores were saved from --use-augmented evaluation but
+    # the user didn't pass --use-augmented to this script, try the augmented
+    # labels as a fallback before giving up.
     if scores is not None and y is not None and len(scores) != len(y):
-        print(f"  [ERROR] Score/label length mismatch: {len(scores)} vs {len(y)}")
-        print(f"          Skipping all score-based plots.")
-        scores = None
+        alt_name = 'y_test_aug.npy' if not args.use_augmented else 'y_test.npy'
+        alt_path = data_dir / alt_name
+        if alt_path.exists():
+            y_alt = np.load(alt_path)
+            if len(y_alt) == len(scores):
+                y = y_alt
+                print(f"  [auto] Switched to {alt_name} ({len(y):,} labels, "
+                      f"{int(y.sum()):,} insider) to match score count")
+            else:
+                print(f"  [ERROR] Score/label length mismatch: {len(scores)} vs {len(y)}")
+                print(f"          Neither {label_name} nor {alt_name} matches. "
+                      f"Skipping score-based plots.")
+                scores = None
+        else:
+            print(f"  [ERROR] Score/label length mismatch: {len(scores)} vs {len(y)}")
+            print(f"          Skipping all score-based plots.")
+            scores = None
 
     # ------------------------------------------------------------------
     # Generate plots
     # ------------------------------------------------------------------
     plot_count = 0
 
-    print("\n[1/10] Loss curve...")
+    print("\n[1/11] Loss curve...")
     if history:
         plot_loss_curve(history, plots_dir)
         plot_count += 1
 
-    print("[2/10] Learning rate schedule...")
+    print("[2/11] Learning rate schedule...")
     if history:
         plot_lr_schedule(history, plots_dir)
         plot_count += 1
 
-    print("[3/10] Score distribution...")
+    print("[3/11] Score distribution...")
     if scores is not None and y is not None:
         plot_score_distribution(scores, y, eval_results, plots_dir)
         plot_count += 1
 
-    print("[4/10] Precision-Recall curve...")
+    print("[4/11] Precision-Recall curve...")
     if scores is not None and y is not None:
         plot_pr_curve(scores, y, eval_results, plots_dir)
         plot_count += 1
 
-    print("[5/10] ROC curve...")
+    print("[5/11] ROC curve...")
     if scores is not None and y is not None:
         plot_roc(scores, y, eval_results, plots_dir)
         plot_count += 1
 
-    print("[6/10] Threshold comparison...")
+    print("[6/11] Threshold comparison...")
     if eval_results:
         plot_threshold_comparison(eval_results, plots_dir)
         plot_count += 1
 
-    print("[7/10] Scenario breakdown...")
+    print("[7/11] Scenario breakdown...")
     if eval_results:
         plot_scenario_breakdown(eval_results, plots_dir)
         plot_count += 1
 
-    print("[8/10] Score scatter...")
+    print("[8/11] Score scatter...")
     if scores is not None and y is not None:
         plot_score_scatter(scores, y, eval_results, plots_dir)
         plot_count += 1
 
-    print("[9/10] Confusion matrix...")
+    print("[9/11] Confusion matrix...")
     if eval_results:
         plot_confusion_matrix(eval_results, plots_dir)
         plot_count += 1
 
-    print("[9.5/10] Session-level confusion matrix...")
+    print("[10/11] Session-level confusion matrix...")
     if eval_results:
         plot_session_confusion_matrix(eval_results, plots_dir)
         plot_count += 1
 
-    print("[10/10] Detection timeline...")
+    print("[11/11] Detection timeline...")
     if eval_results:
         plot_detection_timeline(eval_results, plots_dir)
         plot_count += 1
 
     print("\n" + "=" * 60)
-    print(f"PLOTTING COMPLETE — {plot_count}/10 plots generated")
+    print(f"PLOTTING COMPLETE — {plot_count}/11 plots generated")
     print("=" * 60)
     print(f"  Saved to: {plots_dir}")
 

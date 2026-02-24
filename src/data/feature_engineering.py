@@ -810,6 +810,211 @@ def _scale_and_export(conn, config, output_dir):
 
 
 # =========================================================================
+# Inference: Transform with Saved Artifacts (no re-fit)
+# =========================================================================
+
+def transform_with_saved_artifacts(conn, artifacts, user_filter=None):
+    """Apply saved scaler and label mappings to a 'featured' table for inference.
+
+    Unlike ``_scale_and_export`` this does NOT fit a scaler — it uses the
+    means/stds saved during training.  It also maps categorical values using
+    the saved label mappings, assigning unseen values to max_id + 1.
+
+    Args:
+        conn: DuckDB connection with a ``featured`` table already created.
+        artifacts: dict loaded from ``preprocessing_artifacts.pkl``.
+        user_filter: optional list/set of user IDs to restrict to.
+
+    Returns:
+        dict with keys:
+            X_continuous: (n_days, n_continuous) float32
+            X_categorical: (n_days, n_categorical) int64
+            user_ids: (n_days,) object array
+            dates: (n_days,) datetime64 array
+    """
+    scalable_cols = artifacts['scalable_columns']
+    cyclical_cols = artifacts['cyclical_columns']
+    binary_cols = artifacts['binary_columns']
+    cat_cols = artifacts['categorical_columns']
+    means = artifacts['scaler_means']
+    stds = artifacts['scaler_stds']
+    label_mappings = artifacts['label_mappings']
+
+    # Verify columns exist in featured table
+    existing = [r[0] for r in conn.execute("DESCRIBE featured").fetchall()]
+    scalable_cols = [c for c in scalable_cols if c in existing]
+    cyclical_cols = [c for c in cyclical_cols if c in existing]
+    binary_cols = [c for c in binary_cols if c in existing]
+
+    # Optional user filter
+    where_clause = ""
+    if user_filter is not None:
+        user_list = ", ".join(f"'{u}'" for u in user_filter)
+        where_clause = f"WHERE user_id IN ({user_list})"
+
+    order_clause = f"{where_clause} ORDER BY user_id, date" if where_clause else "ORDER BY user_id, date"
+
+    # Fetch scalable columns and apply saved scaler
+    scalable_sql = ", ".join(f'CAST("{c}" AS DOUBLE) AS "{c}"' for c in scalable_cols)
+    scalable_data = conn.execute(f"""
+        SELECT {scalable_sql} FROM featured {order_clause}
+    """).fetchnumpy()
+
+    X_scalable = np.column_stack([scalable_data[c].astype(np.float32) for c in scalable_cols])
+    del scalable_data
+
+    # Apply saved scaler (transform only, no fit)
+    X_scalable = ((X_scalable - means[:len(scalable_cols)]) / stds[:len(scalable_cols)]).astype(np.float32)
+
+    # Fetch cyclical + binary
+    if cyclical_cols + binary_cols:
+        other_sql = ", ".join(f'CAST("{c}" AS DOUBLE) AS "{c}"' for c in cyclical_cols + binary_cols)
+        other_data = conn.execute(f"""
+            SELECT {other_sql} FROM featured {order_clause}
+        """).fetchnumpy()
+        X_other = np.column_stack([
+            other_data[c].astype(np.float32) for c in cyclical_cols + binary_cols
+        ])
+        del other_data
+    else:
+        X_other = np.empty((X_scalable.shape[0], 0), dtype=np.float32)
+
+    X_continuous = np.hstack([X_scalable, X_other])
+    del X_scalable, X_other
+
+    # Fetch categorical — use saved label mappings, handle unseen values
+    cat_raw_names = [c.replace('_encoded', '') for c in cat_cols]
+    cat_sql = ", ".join(f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in cat_raw_names)
+    cat_data = conn.execute(f"""
+        SELECT {cat_sql} FROM featured {order_clause}
+    """).fetchnumpy()
+
+    cat_arrays = []
+    for raw_name in cat_raw_names:
+        mapping = label_mappings.get(raw_name, {})
+        max_id = max(mapping.values()) + 1 if mapping else 0
+        raw_vals = cat_data[raw_name]
+        encoded = np.array([mapping.get(str(v), max_id) for v in raw_vals], dtype=np.int64)
+        cat_arrays.append(encoded)
+    X_categorical = np.column_stack(cat_arrays) if cat_arrays else np.empty((X_continuous.shape[0], 0), dtype=np.int64)
+    del cat_data
+
+    # Fetch metadata
+    meta = conn.execute(f"""
+        SELECT user_id, date FROM featured {order_clause}
+    """).fetchnumpy()
+
+    n_days = X_continuous.shape[0]
+    n_cont = X_continuous.shape[1]
+    expected_cont = len(artifacts['continuous_columns'])
+    if n_cont != expected_cont:
+        print(f"  [warn] Feature count mismatch: got {n_cont}, expected {expected_cont}")
+
+    print(f"  Transformed {n_days:,} days, {n_cont} continuous + {X_categorical.shape[1]} categorical features")
+
+    return {
+        'X_continuous': X_continuous,
+        'X_categorical': X_categorical,
+        'user_ids': meta['user_id'],
+        'dates': meta['date'],
+    }
+
+
+def _apply_event_date_filter(conn, db_path, date_range, config):
+    """Optionally replace src.events with a date-filtered copy.
+
+    When ``date_range`` is provided, copies only the relevant events into
+    a local table and re-attaches the DuckDB so that ``src.events`` points
+    to the filtered data.  All downstream SQL stages reference
+    ``src.events`` and work unchanged.
+
+    The start date is extended by ``lookback + rolling_window`` days so
+    that rolling statistics and sequence creation have enough history.
+
+    Args:
+        conn: DuckDB connection (already attached as ``src``).
+        db_path: path to the DuckDB file (needed for re-attach).
+        date_range: (start_date, end_date) 'YYYY-MM-DD' strings, or None.
+        config: config dict.
+    """
+    if date_range is None:
+        return
+
+    start_date, end_date = date_range
+    lookback = config['model'].get('lookback', 60)
+    rolling_w = config['processing'].get('rolling_window', 20)
+    buffer_days = lookback + rolling_w
+
+    print(f"  Date filter: {start_date} to {end_date} "
+          f"(+{buffer_days}d buffer for history)")
+
+    # Materialize filtered events into a local in-memory table
+    n_before = conn.execute("SELECT COUNT(*) FROM src.events").fetchone()[0]
+    conn.execute(f"""
+        CREATE TABLE _filtered_events AS
+        SELECT * FROM src.events
+        WHERE CAST(datetime AS DATE) >= DATE '{start_date}' - INTERVAL '{buffer_days}' DAY
+          AND CAST(datetime AS DATE) <= DATE '{end_date}'
+    """)
+    n_after = conn.execute("SELECT COUNT(*) FROM _filtered_events").fetchone()[0]
+    print(f"  Events: {n_before:,} total → {n_after:,} in window")
+
+    # Detach original DB, re-attach as writable in-memory schema named 'src'
+    # so that src.events resolves to the filtered table.
+    conn.execute("DETACH src")
+    conn.execute("ATTACH ':memory:' AS src")
+    conn.execute("CREATE TABLE src.events AS SELECT * FROM _filtered_events")
+    conn.execute("DROP TABLE _filtered_events")
+
+    # Re-attach the real DB as 'srcdb' for static tables (users, psychometric, etc.)
+    conn.execute(f"ATTACH '{db_path}' AS srcdb (READ_ONLY)")
+    # Create views so src.users, src.psychometric, etc. resolve correctly
+    for table in ['users', 'psychometric', 'user_changes', 'terminated_users', 'insiders']:
+        try:
+            conn.execute(f"CREATE VIEW src.{table} AS SELECT * FROM srcdb.{table}")
+        except Exception:
+            pass  # table may not exist
+
+
+def run_inference_feature_engineering(db_path, config, artifacts,
+                                      user_filter=None, date_range=None):
+    """Run the full feature engineering pipeline for inference and return arrays.
+
+    Reuses the same SQL stages as training but applies saved scaler/mappings
+    instead of fitting new ones.
+
+    Args:
+        db_path: path to the DuckDB database with raw events.
+        config: config dict.
+        artifacts: dict from preprocessing_artifacts.pkl.
+        user_filter: optional list of user IDs to restrict to.
+        date_range: optional (start_date, end_date) strings in 'YYYY-MM-DD'
+            format.  When provided, only events within this window are
+            processed.  The lookback period is automatically extended so
+            rolling statistics and sequences have enough history.
+
+    Returns:
+        dict with X_continuous, X_categorical, user_ids, dates arrays.
+    """
+    conn = duckdb.connect()
+    conn.execute(f"ATTACH '{db_path}' AS src (READ_ONLY)")
+    conn.execute("SET threads = 4")
+
+    try:
+        _apply_event_date_filter(conn, db_path, date_range, config)
+        _create_daily_aggregation(conn)
+        _create_sessions_table(conn)
+        _compute_session_features(conn)
+        _merge_session_stats(conn)
+        _enrich_daily(conn)
+        _compute_features(conn, config)
+        result = transform_with_saved_artifacts(conn, artifacts, user_filter)
+        return result
+    finally:
+        conn.close()
+
+
+# =========================================================================
 # Persist Sessions to DuckDB
 # =========================================================================
 

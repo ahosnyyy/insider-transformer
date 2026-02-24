@@ -1,14 +1,15 @@
 # Insider Threat Detection — InsiderTransformerAE
 
-Full Reconstruction Autoencoder Transformer for insider threat detection on the CERT R4.2 dataset.
+Hybrid Session→Daily Transformer Autoencoder for insider threat detection on the CERT R4.2 dataset.
 
 ## Architecture
 
-- **Model**: Encoder-only Transformer (`InsiderTransformerAE`) with full autoencoder reconstruction (no masking)
-- **Training**: Full MSE loss on all positions (no masking), train ONLY on normal user behavior
+- **Model**: Encoder-only Transformer (`InsiderTransformerAE`) with reconstruction loss
+- **Features**: Hybrid pipeline — daily activity counts + session-level statistics (duration, timing, entropy, USB/exe patterns)
+- **Training**: Train ONLY on normal user behavior; anomalous behavior produces high reconstruction error
 - **Categorical handling**: Categorical features (user, PC, role, department, functional unit) are embedded and serve as context input
 - **Loss**: MSE on behavioral features only (personality traits excluded as context-only)
-- **Inference**: Single forward pass per sequence → reconstruction error = anomaly
+- **Inference**: Single forward pass per sequence → reconstruction error = anomaly score
 - **Scoring**: `0.5 * mean_day_error + 0.5 * max_day_error` — captures both sustained and spike anomalies
 - **Granularity**: Daily aggregation (60 active days per sequence, stride 5 days)
 
@@ -30,6 +31,8 @@ Full Reconstruction Autoencoder Transformer for insider threat detection on the 
 
 ```
 01_prepare_data.py → 02_feature_engineering.py → 03_train.py → 04_evaluate.py → 05_plot.py
+                                                                                    ↓
+                                                                              06_inference.py
 ```
 
 ---
@@ -78,10 +81,11 @@ python scripts/02_feature_engineering.py --no-augment
 python scripts/02_feature_engineering.py --skip-sequences
 ```
 
-Three stages:
-1. **Daily aggregation**: Group events by `(user_id, date)` in DuckDB SQL → StandardScaler fitted on train users only
-2. **Sequence creation**: 60-day sliding windows with stride 5 → train/val/test splits (70/15/15 by user)
-3. **Augmentation**: Jittering, feature dropout, scaling on insider test sequences
+Four stages:
+1. **Daily aggregation**: Group events by `(user_id, date)` in DuckDB SQL + session detection (Logon/Logoff pairing) + per-session feature extraction + daily session stats
+2. **Feature computation**: Log1p transforms, z-scores, rolling stats, cyclical encoding, interaction features → StandardScaler fitted on train users only
+3. **Sequence creation**: 60-day sliding windows with stride 5 → train/val/test splits (70/15/15 by user)
+4. **Augmentation**: Jittering, feature dropout, scaling on insider test sequences
 
 ### Outputs
 
@@ -109,7 +113,7 @@ data/processed/
 
 ## Step 3: Training
 
-Train InsiderTransformerAE with full reconstruction (no masking). Supports resume, mixed precision, and periodic test evaluation.
+Train InsiderTransformerAE with reconstruction loss. Supports resume, mixed precision, and periodic test evaluation.
 
 ```bash
 python scripts/03_train.py
@@ -220,7 +224,7 @@ outputs/
 
 ## Step 5: Plotting
 
-Generate 10 publication-quality plots from saved outputs. No model loading required. All plots use **seaborn** styling for professional, consistent visualizations with automatic legend positioning.
+Generate publication-quality plots from saved outputs. No model loading required. All plots use **seaborn** styling for professional, consistent visualizations with automatic legend positioning.
 
 ```bash
 python scripts/05_plot.py
@@ -246,6 +250,7 @@ python scripts/05_plot.py --dry-run
 | 8 | Anomaly score scatter | `score_scatter.png` |
 | 9 | Confusion matrix (best_f1) | `confusion_matrix.png` |
 | 10 | Detection timeline by insider user | `detection_timeline.png` |
+| 11 | Session-level confusion matrix | `confusion_matrix_session.png` |
 
 **Visualization Features:**
 - **Seaborn styling**: All plots use seaborn's `whitegrid` style with consistent color palettes
@@ -262,17 +267,65 @@ outputs/plots/detection_timeline_individual/ ← Individual per-user timeline pl
 
 ---
 
-## Dependencies
+## Step 6: Inference
+
+Score users for insider threat risk using the trained model. Runs the full pipeline: feature engineering → sequencing → scoring → report.
+
+```bash
+# Score all users
+python scripts/06_inference.py
+
+# Score a specific user
+python scripts/06_inference.py --user-id ACME/user123
+
+# Score a date range (only processes events in that window)
+python scripts/06_inference.py --start-date 2011-03-01 --end-date 2011-04-01
+
+# Combine user + date range
+python scripts/06_inference.py --user-id ACME/user123 --start-date 2011-03-01 --end-date 2011-04-01
+
+# Custom threshold
+python scripts/06_inference.py --threshold 0.85
+
+# Use a different threshold method
+python scripts/06_inference.py --threshold-method percentile_99
+
+# Show top 20 riskiest users
+python scripts/06_inference.py --top-k 20
+```
+
+The script reads from the DuckDB database and uses saved preprocessing artifacts (scaler means/stds, label mappings) from training — no re-fitting. Default threshold is `best_f1` from evaluation results. Date ranges automatically include a buffer period for rolling statistics and sequence history.
+
+### Outputs
+
+```
+outputs/
+  inference_report.json    ← Per-user risk report (severity, scores, risk indicators, top windows)
+  inference_scores.npz     ← Raw scores + user IDs + dates for further analysis
+```
+
+### Report Structure
+
+Each user entry includes:
+- **Severity** (HIGH / MEDIUM / LOW / NORMAL)
+- **Anomaly scores** (max, mean, detection rate)
+- **Top anomalous windows** with dates
+- **Risk indicators** — human-readable labels for the most anomalous feature groups
+
+---
+
+## Configuration
 
 All parameters in `config/config.yaml`. Key sections:
 
 | Section | Controls |
 |---|---|
 | `model` | Transformer dims (d_model=128, d_ff=512), lookback (60 days), dropout (0.2) |
-| `training` | Loss (MSE, full reconstruction), epochs (200), batch size (128), LR (0.0003), warmup, early stopping |
+| `training` | Loss (MSE), epochs (200), batch size (128), LR (0.0003), warmup, early stopping |
 | `embeddings` | Embedding dimensions per categorical feature |
-| `features` | Feature lists: continuous (~45), cyclical (2), binary (5), categorical (5), context_only (5) |
+| `features` | Feature lists: continuous, session, interaction, cyclical, binary, categorical, context_only |
 | `scoring` | Anomaly score method (mean_plus_max), weights |
+| `masking` | Masked reconstruction settings (enabled, mask_ratio, strategy) |
 | `augmentation` | Insider test set augmentation (jittering, feature dropout, scaling) |
 | `evaluation` | Threshold methods, primary metric (AUPRC), detection level (user-level) |
 
@@ -296,7 +349,7 @@ data/raw/
     insiders.csv
 ```
 
-**Note**: Daily aggregation requires only the above files. No session-based preprocessing needed.
+**Note**: The pipeline automatically detects sessions from Logon/Logoff events and computes session-level features.
 
 ---
 
@@ -305,6 +358,5 @@ data/raw/
 - Python 3.10+
 - PyTorch 2.0+
 - DuckDB
-- NumPy, pandas, scikit-learn, matplotlib, **seaborn**, tqdm, PyYAML
+- NumPy, scikit-learn, matplotlib, seaborn, tqdm, PyYAML
 - TensorBoard (optional, for training visualization)
-- pytest (for testing)
