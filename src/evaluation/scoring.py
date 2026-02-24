@@ -1,7 +1,17 @@
 """
-Scoring Module — Daily Version
-==============================
-Compute anomaly scores for InsiderTransformerAE (single forward pass).
+Scoring Module — Session-Aware Daily Features
+===============================================
+Compute anomaly scores for InsiderTransformerAE using session-aware features.
+
+Scoring Method:
+- Mean + Max reconstruction error across behavioral features
+- Combines average pattern deviation with peak anomaly detection
+- Excludes personality traits (context-only features) from scoring
+- Single forward pass per sequence for efficient batch processing
+
+Output:
+- Per-sequence anomaly scores (higher = more anomalous)
+- Used for threshold-based insider threat detection
 """
 
 import time
@@ -12,16 +22,24 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 @torch.no_grad()
 def score_dataset(model, loader, device, desc="Scoring", use_amp=False):
-    """Compute anomaly scores for a dataset with progress reporting.
-
+    """
+    Compute anomaly scores for sequences with session-aware features.
+    
+    Process:
+    1. Forward pass through Transformer autoencoder
+    2. Compute reconstruction error per sequence
+    3. Combine mean + max error for robust scoring
+    4. Return scores for threshold-based detection
+    
     Args:
-        model: InsiderTransformerAE model.
-        loader: DataLoader yielding (x_cont, x_cat) batches.
-        device: torch device.
-        desc: Label for progress messages.
-        use_amp: Enable float16 autocast on CUDA.
+        model: InsiderTransformerAE model trained on normal behavior
+        loader: DataLoader yielding (x_cont, x_cat) batches with session features
+        device: torch device (CPU/GPU)
+        desc: Label for progress messages
+        use_amp: Enable float16 autocast on CUDA for faster inference
+        
     Returns:
-        Numpy array of per-sequence anomaly scores.
+        scores: Numpy array of per-sequence anomaly scores (higher = more anomalous)
     """
     model.eval()
     all_scores = []
@@ -57,7 +75,19 @@ def score_dataset(model, loader, device, desc="Scoring", use_amp=False):
 
 
 def compute_ranking_metrics(y_true, y_scores):
-    """Compute AUC and AUPRC."""
+    """
+    Compute ranking metrics for anomaly detection performance.
+    
+    AUC (Area Under ROC Curve): Measures overall ranking ability
+    AUPRC (Area Under Precision-Recall Curve): More informative for imbalanced datasets
+    
+    Args:
+        y_true: Binary labels (0=normal, 1=insider)
+        y_scores: Anomaly scores from model (higher = more anomalous)
+        
+    Returns:
+        dict: {'auc': float, 'auprc': float} ranking metrics
+    """
     try:
         auc = roc_auc_score(y_true, y_scores)
         auprc = average_precision_score(y_true, y_scores)

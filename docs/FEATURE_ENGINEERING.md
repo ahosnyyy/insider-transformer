@@ -321,6 +321,53 @@ User A Sequences:
 4. **Sliding windows** - Model learns from overlapping 60-day contexts
 5. **Prediction target** - Model tries to reconstruct the last day in each sequence
 
+### Minimum Days Requirement
+
+Users with fewer than **10 active days** are completely excluded from the dataset. This is a quality filter to ensure meaningful sequences:
+
+**Why exclude users with <10 days:**
+- Insufficient data to learn behavioral patterns
+- Zero-padding would be mostly zeros (80%+ padding)
+- Such short histories don't provide meaningful temporal context
+- Could introduce noise and degrade model performance
+
+**Example:**
+- User with 5 days → 55 zeros + 5 real days = 91% padded data
+- User with 8 days → 52 zeros + 8 real days = 87% padded data
+- User with 10 days → 50 zeros + 10 real days = 83% padded data (minimum acceptable)
+
+**Configuration:**
+```yaml
+model:
+  min_days: 10  # Skip users with fewer than 10 active days
+```
+
+### Zero-Padding for Users with 10-59 Active Days
+
+Users with 10-59 active days are kept and zero-padded to reach 60 days:
+
+**What it means:**
+- Users with <60 days get padded with zeros at the BEGINNING of their sequence
+- Example: User with 45 days → 15 zeros + 45 real days = 60-day sequence
+- Zeros represent "no activity" periods
+
+**Why pad at the beginning:**
+- Preserves temporal order of actual activity
+- Most recent days (real data) are most important for anomaly detection
+- Early zeros represent baseline "no activity" periods
+
+**Visual example:**
+```
+User with 45 active days:
+Days 1-15:   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  ← Padded zeros
+Days 16-60:  [real_data, real_data, ..., real_data]          ← Actual 45 days
+```
+
+**Why this matters:**
+- Ensures consistent 60-day input size for Transformer model
+- No data loss - users with few days still contribute to training
+- Model learns to distinguish between real activity and no-activity periods
+
 ### Feature Processing Pipeline
 
 | Stage | Input | Output | Shape | Processing |

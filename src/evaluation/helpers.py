@@ -1,11 +1,24 @@
 """
-Shared Evaluation Helpers
-=========================
+Shared Evaluation Helpers for Session-Aware Insider Detection
+=============================================================
 Functions used by both 04_evaluate.py and 06_inference.py.
 
-Contains: model loading, threshold computation, metrics, per-user/per-scenario
-breakdowns, severity classification, risk indicator identification, SOC report
-generation, and latency summaries.
+Contains:
+- Model loading with session-aware feature support
+- Threshold computation and calibration
+- Multi-level metrics (user, sequence, session)
+- Per-user/per-scenario breakdowns
+- Session-level evaluation and localization
+- Severity classification and risk indicator identification
+- SOC report generation with session drill-down
+- Detection latency summaries
+- Session-aware scoring and analysis
+
+Key Features:
+- Session-aware feature handling (~52 continuous + 5 categorical)
+- Session-level metrics for precise threat localization
+- Mixed precision (AMP) support for faster evaluation
+- Behavioral feature indexing for reconstruction loss
 """
 
 import json
@@ -33,15 +46,22 @@ from evaluation.scoring import score_dataset
 # =========================================================================
 
 def load_model(checkpoint_path, device, config):
-    """Load trained InsiderTransformerAE from checkpoint.
-
+    """
+    Load trained session-aware InsiderTransformerAE from checkpoint.
+    
+    Loads model with session-aware features and behavioral feature indexing
+    for reconstruction loss computation.
+    
     Args:
         checkpoint_path: Path to .pt checkpoint file or directory containing best_model.pt
-        device: torch device
-        config: config dict
-
+        device: torch device (CPU/GPU)
+        config: Configuration dict with model hyperparameters
+        
     Returns:
-        (model, n_continuous)
+        tuple: (model, n_continuous, checkpoint_dict)
+            - model: Loaded InsiderTransformerAE model
+            - n_continuous: Number of continuous features (~52 with session features)
+            - checkpoint_dict: Full checkpoint with metadata
     """
     if isinstance(checkpoint_path, (str, Path)):
         checkpoint_path = Path(checkpoint_path)
@@ -67,9 +87,21 @@ def load_model(checkpoint_path, device, config):
 
 
 def compute_calibration_scores(model, data_dir, device, batch_size=256, use_amp=False):
-    """Compute scores on validation set for threshold calibration.
-
-    Uses validation set (preferred) or falls back to training set.
+    """
+    Compute anomaly scores on validation set for threshold calibration.
+    
+    Uses session-aware features to compute reconstruction errors for threshold
+    selection. Prefers validation set but falls back to training set if needed.
+    
+    Args:
+        model: Trained InsiderTransformerAE model
+        data_dir: Directory containing feature arrays
+        device: torch device (CPU/GPU)
+        batch_size: Batch size for scoring (default: 256)
+        use_amp: Enable mixed precision for faster scoring (default: False)
+        
+    Returns:
+        scores: Numpy array of anomaly scores for calibration
     """
     for name in ['X_val_continuous.npy', 'X_train_continuous.npy']:
         cont_path = Path(data_dir) / name

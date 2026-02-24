@@ -1,22 +1,37 @@
 """
 Evaluation Script — InsiderTransformerAE
 =========================================
-Evaluate the trained model using reconstruction error (standalone ML).
+Evaluate the session-aware Transformer model using reconstruction error.
+
+Model Features:
+- Session-aware daily features (~52 continuous + 5 categorical)
+- Full reconstruction (no masking) on behavioral features
+- 60-day sequences with session-derived statistics
+- Trained on normal users, evaluated on mixed normal/insider data
 
 Computes:
-  1. Single-pass anomaly scores on test set
+  1. Single-pass anomaly scores on test set using session-aware features
   2. Threshold-independent metrics (AUPRC, AUROC, score separation)
   3. Multiple threshold methods with per-threshold P/R/F1
   4. Per-user detection breakdown + aggregate user-level metrics
   5. Per-scenario breakdown (from DuckDB insiders table)
-  6. Detection latency (sequence-based and time-based)
-  7. SOC alert report (outputs/soc_report.json)
-  8. Saves scores + metrics for plotting (05_plot.py)
+  6. Session-level metrics (precision, recall, localization accuracy)
+  7. Detection latency (sequence-based and time-based)
+  8. SOC alert report with session drill-down (outputs/soc_report.json)
+  9. Saves scores + metrics for plotting (05_plot.py)
+
+Key Features:
+- Session-level evaluation for precise threat localization
+- Multi-level metrics (user, sequence, session)
+- Mixed precision (AMP) available with --amp flag (disabled by default)
+- Session drill-down in SOC reports for analyst investigation
 
 Usage:
-    python scripts/04_evaluate.py
+    python scripts/04_evaluate.py                                    # Default (AMP disabled)
+    python scripts/04_evaluate.py --amp                              # Enable mixed precision
     python scripts/04_evaluate.py --threshold best_f1
     python scripts/04_evaluate.py --load-scores              # skip scoring, load cached
+    python scripts/04_evaluate.py --use-augmented           # use augmented test set
     python scripts/04_evaluate.py --exclude-scenarios 3      # exclude scenario 3
     python scripts/04_evaluate.py --exclude-scenarios 2 3    # exclude scenarios 2 and 3
     python scripts/04_evaluate.py --dry-run                  # evaluate using dry run checkpoints
@@ -87,6 +102,8 @@ def main():
                         help='Use augmented test set instead of original')
     parser.add_argument('--dry-run', action='store_true',
                         help='Evaluate using dry run checkpoints (outputs/dry_run/)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable mixed precision (AMP) on GPU (disabled by default)')
     args = parser.parse_args()
 
     config = load_config()
@@ -108,10 +125,12 @@ def main():
         print(f"  Excluding scenarios: {args.exclude_scenarios}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    use_amp = device.type == 'cuda'
+    use_amp = torch.cuda.is_available() and args.amp  # Opt-in with --amp
     print(f"  Device: {device}")
     if use_amp:
-        print(f"  Mixed precision (AMP): enabled for inference")
+        print(f"  Mixed precision (AMP): enabled")
+    else:
+        print(f"  Mixed precision (AMP): disabled")
     t_start = time.time()
 
     # ------------------------------------------------------------------

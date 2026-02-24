@@ -5,15 +5,22 @@ Encoder-only Transformer with full MSE loss (no masking, no [CLS]).
 
 Architecture:
   Input: (batch, seq_len, n_continuous) + (batch, seq_len, n_categorical)
+         Session-aware daily features (~52 continuous + 5 categorical)
   → Continuous: Linear(n_continuous → d_model)
   → Categorical: Embed → Linear(total_embed → d_model)
   → Fuse: Linear(2*d_model → d_model) + LayerNorm + Dropout
-  → + Learned Positional Encoding
-  → Transformer Encoder (4 layers, 8 heads, dropout=0.2)
+  → + Learned Positional Encoding (temporal context for 60-day sequences)
+  → Transformer Encoder (4 layers, 6 heads, dropout=0.2, d_model=192)
   → Reconstruction Head: LayerNorm → Linear(d_model → d_ff) → GELU → Linear(d_ff → n_continuous)
   → Output: (batch, seq_len, n_continuous)
 
-Loss: MSE(input, output) over behavioral features only.
+Loss: MSE(input, output) over behavioral features only (excludes personality traits).
+
+Key Design:
+- Session-aware features capture intra-day behavioral patterns
+- Positional encoding provides temporal order for sequences
+- Full reconstruction learns complete behavioral patterns
+- Behavioral indices allow excluding context-only features from loss
 """
 
 import torch
@@ -56,22 +63,28 @@ class CategoricalEmbedding(nn.Module):
 class InsiderTransformerAE(nn.Module):
     """
     Full reconstruction Transformer autoencoder for insider threat detection.
-
-    Dual-input: continuous features + categorical embeddings.
-    No masking, no [CLS] token. Full MSE loss on behavioral features.
-
+    
+    Processes session-aware daily features from 60-day sequences to learn
+    normal behavioral patterns. Anomalies are detected via high reconstruction error.
+    
+    Architecture Details:
+    - Dual-input: continuous features (~52) + categorical embeddings (5)
+    - Session-aware features capture intra-day behavioral patterns
+    - No masking, no [CLS] token - full reconstruction approach
+    - MSE loss computed on behavioral features only (excludes personality traits)
+    
     Args:
-        n_continuous: Number of continuous input features
-        cat_cardinalities: {feature_name: num_categories}
-        cat_embed_dims: {feature_name: embedding_dim}
-        d_model: Transformer hidden dimension (default: 128)
-        n_heads: Number of attention heads (default: 8)
+        n_continuous: Number of continuous input features (~52 with session features)
+        cat_cardinalities: {feature_name: num_categories} for 5 categorical features
+        cat_embed_dims: {feature_name: embedding_dim} for each categorical feature
+        d_model: Transformer hidden dimension (default: 128, typically 192)
+        n_heads: Number of attention heads (default: 8, typically 6)
         n_layers: Number of encoder layers (default: 4)
         d_ff: Feedforward dimension (default: 512)
-        max_seq_len: Maximum sequence length (default: 60)
+        max_seq_len: Maximum sequence length (default: 60 days)
         dropout: Dropout rate (default: 0.2)
         behavioral_indices: Optional list of feature indices used for loss/scoring.
-            If None, all n_continuous features are used.
+            Excludes personality traits (context-only features) from reconstruction.
     """
 
     def __init__(

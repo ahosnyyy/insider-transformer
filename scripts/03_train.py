@@ -1,14 +1,29 @@
 """
 Training Script — InsiderTransformerAE
 =======================================
-Train the full-reconstruction Transformer autoencoder on normal behavior.
+Train the full-reconstruction Transformer autoencoder on normal user behavior.
+
+Model: Session-aware Transformer with ~52 continuous + 5 categorical features
+      - Full reconstruction (no masking) on behavioral features only
+      - 60-day sequences with session-derived daily features
+      - Trained on normal users only (insiders excluded)
+
+Key Features:
+- Session-aware features capture intra-day behavioral patterns
+- Positional encoding provides temporal context
+- AdamW optimizer with cosine learning rate schedule
+- Mixed precision training (AMP) available with --amp flag (disabled by default)
+- Early stopping based on validation loss
+- TensorBoard logging for monitoring
 
 Usage:
     conda activate insider-threat
-    python scripts/03_train.py
+    python scripts/03_train.py                                    # Default training (AMP disabled)
+    python scripts/03_train.py --amp                              # Enable mixed precision
     python scripts/03_train.py --epochs 100 --batch-size 128 --lr 0.0003
-    python scripts/03_train.py --resume                     # resume from checkpoint
-    python scripts/03_train.py --dry-run                     # test pipeline (1 epoch, few steps)
+    python scripts/03_train.py --resume                         # Resume from checkpoint
+    python scripts/03_train.py --dry-run                         # Test pipeline (1 epoch)
+    python scripts/03_train.py --config config/custom.yaml       # Custom config
 """
 
 import argparse
@@ -40,7 +55,20 @@ from evaluation.scoring import score_dataset, compute_ranking_metrics
 # =========================================================================
 
 def load_data(data_dir):
-    """Load train/val sequences."""
+    """
+    Load training and validation sequences with session-aware features.
+    
+    Loads:
+    - X_{split}_continuous.npy: (n_sequences, 60, ~52) session-aware daily features
+    - X_{split}_categorical.npy: (n_sequences, 60, 5) categorical embeddings
+    
+    Args:
+        data_dir: Directory containing feature arrays from feature engineering
+        
+    Returns:
+        train_dataset: TensorDataset for training (continuous, categorical)
+        val_dataset: TensorDataset for validation (continuous, categorical)
+    """
     X_train_cont = np.load(data_dir / 'X_train_continuous.npy')
     X_train_cat = np.load(data_dir / 'X_train_categorical.npy')
     X_val_cont = np.load(data_dir / 'X_val_continuous.npy')
@@ -67,7 +95,22 @@ def load_data(data_dir):
 
 
 def load_test_data(data_dir):
-    """Load test set for monitoring."""
+    """
+    Load test set for monitoring during training.
+    
+    Used to track performance on unseen data (both normal and insider users)
+    without affecting training. Helps detect overfitting and monitor
+    detection capabilities as training progresses.
+    
+    Args:
+        data_dir: Directory containing test feature arrays
+        
+    Returns:
+        dataset: TensorDataset (continuous, categorical) for scoring
+        y_test: Binary labels (0=normal, 1=insider)
+        user_ids_test: User ID per sequence for analysis
+        timestamps_test: Sequence end dates (optional)
+    """
     X_test_cont = np.load(data_dir / 'X_test_continuous.npy')
     X_test_cat = np.load(data_dir / 'X_test_categorical.npy')
     y_test = np.load(data_dir / 'y_test.npy')
@@ -316,8 +359,8 @@ def main():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from best_model.pt checkpoint')
-    parser.add_argument('--no-amp', action='store_true',
-                        help='Disable mixed precision (AMP) even on GPU')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable mixed precision (AMP) on GPU (disabled by default)')
     parser.add_argument('--eval-interval', type=int, default=10,
                         help='Run evaluation on test set every N epochs')
     parser.add_argument('--checkpoint-interval', type=int, default=10,
@@ -359,9 +402,11 @@ def main():
 
     set_seed(seed)
     device = get_device()
-    use_amp = torch.cuda.is_available() and not args.no_amp
+    use_amp = torch.cuda.is_available() and args.amp  # Opt-in with --amp
     if use_amp:
         print(f"  Mixed precision (AMP): enabled")
+    else:
+        print(f"  Mixed precision (AMP): disabled")
 
     # ------------------------------------------------------------------
     # [1] Load data

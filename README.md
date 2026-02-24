@@ -4,10 +4,12 @@ Hybrid Session→Daily Transformer Autoencoder for insider threat detection on t
 
 ## Architecture
 
-- **Model**: Encoder-only Transformer (`InsiderTransformerAE`) with reconstruction loss
-- **Features**: Hybrid pipeline — daily activity counts + session-level statistics (duration, timing, entropy, USB/exe patterns)
+- **Model**: Encoder-only Transformer (`InsiderTransformerAE`) with full reconstruction loss (no masking)
+- **Features**: Session-aware daily features (~52 continuous + 5 categorical)
+  - Daily activity counts (18) + Session-derived statistics (18)
+  - Interaction features (4) + Cyclical/binary features (7) + Personality traits (5)
 - **Training**: Train ONLY on normal user behavior; anomalous behavior produces high reconstruction error
-- **Categorical handling**: Categorical features (user, PC, role, department, functional unit) are embedded and serve as context input
+- **Categorical handling**: Categorical features (user, PC, role, department, functional_unit) are embedded and serve as context input
 - **Loss**: MSE on behavioral features only (personality traits excluded as context-only)
 - **Inference**: Single forward pass per sequence → reconstruction error = anomaly score
 - **Scoring**: `0.5 * mean_day_error + 0.5 * max_day_error` — captures both sustained and spike anomalies
@@ -17,8 +19,8 @@ Hybrid Session→Daily Transformer Autoencoder for insider threat detection on t
 
 | Parameter | Value |
 |---|---|
-| d_model | 128 |
-| n_heads | 8 |
+| d_model | 192 |
+| n_heads | 6 |
 | n_layers | 4 |
 | d_ff | 512 |
 | Sequence length | 60 days |
@@ -26,6 +28,7 @@ Hybrid Session→Daily Transformer Autoencoder for insider threat detection on t
 | Reconstruction head | 2-layer (LayerNorm → Linear → GELU → Linear) |
 | Granularity | Daily (60 active days) |
 | Stride | 5 days |
+| Features | ~52 continuous + 5 categorical (session-aware) |
 
 ## Pipeline
 
@@ -34,6 +37,14 @@ Hybrid Session→Daily Transformer Autoencoder for insider threat detection on t
                                                                                     ↓
                                                                               06_inference.py
 ```
+
+**Complete workflow:**
+1. **Data Prep**: CSV → Parquet → DuckDB with session detection
+2. **Feature Eng**: Session-aware daily features → 60-day sequences
+3. **Training**: Full reconstruction Transformer on normal users
+4. **Evaluation**: Multi-level metrics (user, sequence, session)
+5. **Visualization**: 11 plots including session-level analysis
+6. **Inference**: Real-time scoring with date range filtering
 
 ---
 
@@ -113,10 +124,10 @@ data/processed/
 
 ## Step 3: Training
 
-Train InsiderTransformerAE with reconstruction loss. Supports resume, mixed precision, and periodic test evaluation.
+Train InsiderTransformerAE with reconstruction loss. Supports resume, mixed precision (opt-in), and periodic test evaluation.
 
 ```bash
-python scripts/03_train.py
+python scripts/03_train.py                                    # Default (AMP disabled)
 
 # Override hyperparameters
 python scripts/03_train.py --epochs 100 --batch-size 128 --lr 0.0003
@@ -124,8 +135,8 @@ python scripts/03_train.py --epochs 100 --batch-size 128 --lr 0.0003
 # Resume from checkpoint
 python scripts/03_train.py --resume
 
-# Disable mixed precision
-python scripts/03_train.py --no-amp
+# Enable mixed precision for faster training
+python scripts/03_train.py --amp
 
 # Evaluate on test set every N epochs
 python scripts/03_train.py --eval-interval 10
@@ -169,25 +180,22 @@ outputs/
 
 ## Step 4: Evaluation
 
-Compute anomaly scores, threshold-independent metrics, per-threshold breakdowns, per-user and per-scenario results.
+Comprehensive evaluation with multi-level metrics (user, sequence, session) and SOC report generation.
 
 ```bash
-python scripts/04_evaluate.py
+python scripts/04_evaluate.py                                    # Default (AMP disabled)
 
-# Specific threshold method
-python scripts/04_evaluate.py --threshold best_f1
+# Use augmented test set
+python scripts/04_evaluate.py --use-augmented
 
-# Compare all threshold methods
-python scripts/04_evaluate.py --threshold all
+# Enable mixed precision for faster evaluation
+python scripts/04_evaluate.py --amp
 
 # Exclude specific scenarios
-python scripts/04_evaluate.py --exclude-scenarios 2 3
+python scripts/04_evaluate.py --exclude-scenarios 3 4
 
-# Load cached scores (skip re-scoring)
-python scripts/04_evaluate.py --load-scores
-
-# Evaluate on augmented test set
-python scripts/04_evaluate.py --use-augmented
+# Override batch size
+python scripts/04_evaluate.py --batch-size 512
 ```
 
 ### Metrics
@@ -272,8 +280,11 @@ outputs/plots/detection_timeline_individual/ ← Individual per-user timeline pl
 Score users for insider threat risk using the trained model. Runs the full pipeline: feature engineering → sequencing → scoring → report.
 
 ```bash
-# Score all users
+# Score all users (AMP disabled by default)
 python scripts/06_inference.py
+
+# Enable mixed precision for faster inference
+python scripts/06_inference.py --amp
 
 # Score a specific user
 python scripts/06_inference.py --user-id ACME/user123

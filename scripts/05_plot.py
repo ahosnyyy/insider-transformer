@@ -1,7 +1,13 @@
 """
-Plotting Script — InsiderTransformerAE
-=======================================
+Plotting Script — Session-Aware InsiderTransformerAE
+===================================================
 Generate visualization plots from training history and evaluation results.
+
+Model Context:
+- Session-aware Transformer with ~52 continuous + 5 categorical features
+- Full reconstruction (no masking) on behavioral features
+- 60-day sequences with session-derived statistics
+- Multi-level evaluation (user, sequence, session)
 
 Plots (all derived from saved outputs — no model loading required):
   1. Training / validation loss curve
@@ -13,12 +19,19 @@ Plots (all derived from saved outputs — no model loading required):
   7. Per-scenario breakdown
   8. Anomaly score scatter
   9. Confusion matrix (best_f1 threshold)
-  9.5. Session-level confusion matrix
+  10. Session-level confusion matrix
+  11. Detection timeline with individual user plots
+
+Key Features:
+- Session-level plots for precise threat localization analysis
+- Individual user timeline plots for detailed investigation
+- Auto-detection of augmented vs non-augmented data
+- 11 comprehensive plots covering all evaluation aspects
 
 Usage:
-    python scripts/05_plot.py
-    python scripts/05_plot.py --use-augmented
-    python scripts/05_plot.py --dry-run                  # plot from dry run outputs
+    python scripts/05_plot.py                                    # Default
+    python scripts/05_plot.py --use-augmented                       # Use augmented test set
+    python scripts/05_plot.py --dry-run                              # Plot from dry run outputs
 """
 
 import argparse
@@ -60,11 +73,18 @@ plt.rcParams['grid.alpha'] = 0.3
 # =========================================================================
 
 def plot_loss_curve(history: dict, plots_dir: Path):
-    train_loss = history.get('train_loss', [])
-    val_loss = history.get('val_loss', [])
-    if not train_loss or not val_loss:
-        print("  [skip] No loss data in training history")
-        return
+    """
+    Plot training and validation loss curves with best epoch marker.
+    
+    Shows model convergence during training on session-aware features.
+    
+    Args:
+        history: Training history dict with 'train_loss' and 'val_loss'
+        plots_dir: Directory to save the plot
+        
+    Output:
+        Saves 'loss_curve.png' with training/validation curves and best epoch marker
+    """
     
     epochs = np.arange(1, len(train_loss) + 1)
     best_epoch = int(np.argmin(val_loss)) + 1
@@ -87,10 +107,19 @@ def plot_loss_curve(history: dict, plots_dir: Path):
 
 
 def plot_lr_schedule(history: dict, plots_dir: Path):
-    lr = history.get('lr', [])
-    if not lr:
-        print("  [skip] No lr data in training history")
-        return
+    """
+    Plot learning rate schedule across training epochs.
+    
+    Shows the cosine learning rate schedule used with AdamW optimizer
+    during training of the session-aware Transformer model.
+    
+    Args:
+        history: Training history dict with 'lr' list
+        plots_dir: Directory to save the plot
+        
+    Output:
+        Saves 'lr_schedule.png' showing learning rate progression
+    """
 
     epochs = np.arange(1, len(lr) + 1)
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -107,6 +136,21 @@ def plot_lr_schedule(history: dict, plots_dir: Path):
 
 def plot_score_distribution(scores: np.ndarray, y: np.ndarray,
                             eval_results: dict, plots_dir: Path):
+    """
+    Plot anomaly score distribution for normal vs insider users.
+    
+    Shows how well the session-aware Transformer separates normal from anomalous
+    behavior using reconstruction error on session-aware features.
+    
+    Args:
+        scores: Anomaly scores from reconstruction error
+        y: Binary labels (0=normal, 1=insider)
+        eval_results: Evaluation results dict containing metrics
+        plots_dir: Directory to save the plot
+        
+    Output:
+        Saves 'score_distribution.png' with score distributions and statistics
+    """
     normal_scores = scores[y == 0]
     insider_scores = scores[y == 1]
 
@@ -331,12 +375,22 @@ def plot_score_scatter(scores: np.ndarray, y: np.ndarray,
 
 
 def plot_detection_timeline(eval_results: dict, plots_dir: Path):
-    """Plot 10: Detection timeline — one row per insider user showing when
-    the model detected them relative to their ground-truth activity window.
+    """
+    Plot detection timeline for insider users with session-aware context.
     
-    Creates:
-    - detection_timeline.png: Combined overview (all users)
-    - detection_timeline_individual/: Individual plots per user
+    Shows when the model detected each insider user relative to their ground-truth
+    activity window, leveraging session-aware features for precise temporal analysis.
+    
+    Generates both a consolidated timeline and individual per-user plots
+    for detailed investigation of detection patterns.
+    
+    Args:
+        eval_results: Evaluation results dict containing user breakdown data
+        plots_dir: Directory to save plots
+        
+    Output:
+        Saves 'detection_timeline.png' (consolidated) and individual plots
+        in 'detection_timeline_individual/' subdirectory
     """
     pur = eval_results.get('per_user_results', [])
     if not pur:
@@ -565,7 +619,19 @@ def plot_confusion_matrix(eval_results: dict, plots_dir: Path):
 
 
 def plot_session_confusion_matrix(eval_results: dict, plots_dir: Path):
-    """Plot session-level confusion matrix from session_level_metrics."""
+    """
+    Plot session-level confusion matrix for precise threat localization.
+    
+    Shows how well the model identifies specific suspicious sessions within
+    flagged days, leveraging session-aware features for fine-grained analysis.
+    
+    Args:
+        eval_results: Evaluation results dict containing session_level_metrics
+        plots_dir: Directory to save the plot
+        
+    Output:
+        Saves 'session_confusion_matrix.png' with session-level confusion matrix
+    """
     session_metrics = eval_results.get('session_level_metrics')
     if not session_metrics:
         print("  [skip] No session_level_metrics available")

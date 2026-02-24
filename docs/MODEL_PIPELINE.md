@@ -40,6 +40,9 @@ model:
   d_model: 192                   # model dimension
   d_ff: 512                      # feed-forward dimension
   dropout: 0.2                   # dropout rate
+
+# Note: Users with <10 active days are excluded to avoid excessive zero-padding
+# (e.g., 5 days → 55 zeros + 5 real days = 91% padded data)
 ```
 
 ### 1.3 Full Reconstruction Training
@@ -292,6 +295,16 @@ metrics = {
 }
 ```
 
+**Why evaluate sessions only during malicious periods?**
+
+1. **Ground Truth Limitation**: CERT dataset only labels insider periods, not individual sessions
+2. **Precision Focus**: Analysts care most about "when model flags a session, is it actually malicious?"
+3. **Practical Relevance**: False positives in normal periods are less critical than missed threats
+4. **Resource Allocation**: Security teams need to know which flagged sessions warrant investigation
+5. **Threat Localization**: Helps identify the specific time windows and activities that triggered alerts
+
+This approach evaluates the model's precision at the session level - crucial for operational deployment where analysts must investigate flagged sessions.
+
 ---
 
 ## 4. Visualization Pipeline
@@ -325,7 +338,10 @@ The script generates **11 plots** organized into categories:
 8. **Per-Scenario Performance** - Detection rate by insider scenario
 
 #### Session-Level Analysis (2 plots)
-9. **Session Confusion Matrix** - Session-level classification
+9. **Session Confusion Matrix** - Session-level classification (malicious periods only)
+   - Evaluates model's ability to identify specific suspicious sessions within insider periods
+   - Focuses only on sessions during known malicious time windows for precise threat localization
+   - Cannot evaluate true negatives (normal sessions) as ground truth only covers insider periods
 10. **Session Duration Analysis** - Duration of flagged vs normal sessions
 
 #### Feature Analysis (1 plot)

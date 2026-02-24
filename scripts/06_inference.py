@@ -1,17 +1,35 @@
 """
-Inference Script — InsiderTransformerAE
-=======================================
-Score users for insider threat risk using a trained model.
+Inference Script — Session-Aware InsiderTransformerAE
+=================================================
+Score users for insider threat risk using the trained session-aware model.
 
-Runs the full pipeline: feature engineering → sequencing → scoring → report.
-Uses saved preprocessing artifacts (scaler, label mappings) from training.
+Model Features:
+- Session-aware daily features (~52 continuous + 5 categorical)
+- Full reconstruction (no masking) on behavioral features
+- 60-day sequences with session-derived statistics
+- Real-time scoring with date range filtering
+
+Pipeline:
+1. Session-aware feature engineering ( DuckDB SQL )
+2. 60-day sequence creation with zero-padding
+3. Anomaly scoring using reconstruction error
+4. Risk assessment and report generation
+
+Key Features:
+- Date range filtering for incremental scoring
+- User-specific scoring with session context
+- Mixed precision (AMP) available with --amp flag (disabled by default)
+- Risk indicators and severity classification
+- JSON report output for integration
 
 Usage:
     conda activate insider-threat
-    python scripts/06_inference.py                          # score all users
+    python scripts/06_inference.py                          # score all users (AMP disabled)
+    python scripts/06_inference.py --amp                      # enable mixed precision
     python scripts/06_inference.py --user-id ACME/user123   # score one user
     python scripts/06_inference.py --threshold 0.85         # custom threshold
     python scripts/06_inference.py --top-k 20               # show top 20 riskiest
+    python scripts/06_inference.py --start-date 2011-03-01 --end-date 2011-04-01  # date range
 """
 
 import argparse
@@ -44,7 +62,18 @@ from utils.common import load_config
 # =========================================================================
 
 def load_artifacts(data_dir):
-    """Load preprocessing artifacts saved during training."""
+    """
+    Load preprocessing artifacts saved during training.
+    
+    Loads scaler parameters, feature mappings, and metadata needed for
+    consistent feature preprocessing during inference.
+    
+    Args:
+        data_dir: Directory containing preprocessing_artifacts.pkl
+        
+    Returns:
+        dict: Preprocessing artifacts (scaler, feature lists, metadata)
+    """
     artifacts_path = data_dir / 'preprocessing_artifacts.pkl'
     if not artifacts_path.exists():
         raise FileNotFoundError(
@@ -55,12 +84,23 @@ def load_artifacts(data_dir):
         return pickle.load(f)
 
 
-def load_threshold(output_dir, method='percentile_99'):
-    """Load threshold from evaluation results, or compute from calibration scores.
-
-    Priority:
-      1. evaluation_results.json → thresholds → <method>
-      2. calibration_scores.npy → compute percentile_99 / mean+3std
+def load_threshold(method, output_dir):
+    """
+    Load anomaly threshold from evaluation results with fallback options.
+    
+    Tries multiple sources in order: requested method → available methods → 
+    computed from calibration scores. Used for determining which sequences
+    are flagged as anomalous during inference.
+    
+    Args:
+        method: Threshold method name ('best_f1', 'percentile_99', etc.)
+        output_dir: Directory containing evaluation_results.json
+        
+    Returns:
+        float: Threshold value for anomaly detection
+        
+    Raises:
+        FileNotFoundError: If no threshold source is available
     """
     eval_path = output_dir / 'evaluation_results.json'
     if eval_path.exists():
@@ -93,15 +133,30 @@ def load_threshold(output_dir, method='percentile_99'):
 
 
 def build_sequences_for_inference(X_cont, X_cat, user_ids, dates, lookback):
-    """Build sliding-window sequences per user for inference.
-
-    Uses stride=1 for maximum coverage (every possible window).
-
+    """
+    Build sliding-window sequences per user for real-time inference.
+    
+    Creates sequences with stride=1 for maximum coverage, ensuring every
+    possible 60-day window is evaluated. Uses session-aware features
+    and handles zero-padding for users with insufficient history.
+    
+    Args:
+        X_cont: (n_days, n_continuous) session-aware continuous features
+        X_cat: (n_days, n_categorical) categorical features
+        user_ids: (n_days,) user ID per day
+        dates: (n_days,) datetime64 per day
+        lookback: Sequence length (default: 60 days)
+        
     Returns:
-        X_seq_cont: (n_sequences, lookback, n_continuous)
-        X_seq_cat: (n_sequences, lookback, n_categorical)
-        seq_user_ids: (n_sequences,) user ID per sequence
-        seq_dates: (n_sequences,) end-date per sequence
+        tuple: (X_seq_cont, X_seq_cat, seq_user_ids, seq_dates)
+            - X_seq_cont: (n_sequences, lookback, n_continuous) continuous sequences
+            - X_seq_cat: (n_sequences, lookback, n_categorical) categorical sequences
+            - seq_user_ids: (n_sequences,) user ID per sequence
+            - seq_dates: (n_sequences,) end-date per sequence
+            
+    Note:
+        Uses stride=1 (vs stride=5 in training) for dense temporal coverage
+        during inference, ensuring no potential threats are missed.
     """
     stride = 1  # dense coverage for inference
     unique_users = np.unique(user_ids)
@@ -143,7 +198,31 @@ def build_sequences_for_inference(X_cont, X_cat, user_ids, dates, lookback):
 
 def build_user_report(user_id, user_scores, user_dates, threshold,
                       model, user_cont, user_cat, config, device):
-    """Build a per-user risk report entry."""
+    """
+    Build comprehensive per-user risk report with severity classification.
+    
+    Analyzes a user's anomaly scores to determine risk level, detection patterns,
+    and identify specific risk indicators using session-aware features.
+    
+    Args:
+        user_id: User identifier
+        user_scores: Anomaly scores for user's sequences
+        user_dates: End dates for each sequence
+        threshold: Anomaly threshold for flagging
+        model: Trained InsiderTransformerAE model
+        user_cont: User's continuous features for risk analysis
+        user_cat: User's categorical features for risk analysis
+        config: Configuration dict
+        device: torch device
+        
+    Returns:
+        dict: User report entry with:
+            - severity: Risk level (NORMAL/LOW/MEDIUM/HIGH)
+            - anomaly_score_max/mean: Score statistics
+            - flagged_sequences/total_sequences: Detection counts
+            - detection_rate: Fraction of flagged sequences
+            - risk_indicators: List of suspicious behaviors
+    """
     n_total = len(user_scores)
     n_flagged = int((user_scores >= threshold).sum())
     max_score = float(user_scores.max())
@@ -218,8 +297,8 @@ def main():
                         help='Show top K riskiest users in console output')
     parser.add_argument('--batch-size', type=int, default=256,
                         help='Batch size for scoring')
-    parser.add_argument('--no-amp', action='store_true',
-                        help='Disable mixed precision')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable mixed precision (AMP) on GPU (disabled by default)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output JSON path (default: outputs/inference_report.json)')
     args = parser.parse_args()
@@ -299,7 +378,7 @@ def main():
     # [4] Score
     # ------------------------------------------------------------------
     print(f"\n[4] Scoring...")
-    use_amp = torch.cuda.is_available() and not args.no_amp
+    use_amp = torch.cuda.is_available() and args.amp  # Opt-in with --amp
 
     dataset = TensorDataset(
         torch.tensor(X_seq_cont, dtype=torch.float32),

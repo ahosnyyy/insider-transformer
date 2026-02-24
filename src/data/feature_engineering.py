@@ -865,23 +865,29 @@ def _scale_and_export(conn, config, output_dir):
 # =========================================================================
 
 def transform_with_saved_artifacts(conn, artifacts, user_filter=None):
-    """Apply saved scaler and label mappings to a 'featured' table for inference.
-
-    Unlike ``_scale_and_export`` this does NOT fit a scaler — it uses the
-    means/stds saved during training.  It also maps categorical values using
-    the saved label mappings, assigning unseen values to max_id + 1.
-
+    """
+    Apply saved preprocessing artifacts to session-aware features for inference.
+    
+    Reuses the exact scaler parameters and categorical mappings from training
+    to ensure consistent feature representation. Handles unseen categorical values
+    by assigning them to max_id + 1. Does NOT fit new scalers - preserves
+    training preprocessing exactly.
+    
     Args:
-        conn: DuckDB connection with a ``featured`` table already created.
-        artifacts: dict loaded from ``preprocessing_artifacts.pkl``.
-        user_filter: optional list/set of user IDs to restrict to.
-
+        conn: DuckDB connection with session-aware 'featured' table already created
+        artifacts: Preprocessing artifacts dict from training (scaler, mappings, metadata)
+        user_filter: Optional list/set of user IDs to restrict analysis to
+        
     Returns:
-        dict with keys:
-            X_continuous: (n_days, n_continuous) float32
-            X_categorical: (n_days, n_categorical) int64
-            user_ids: (n_days,) object array
-            dates: (n_days,) datetime64 array
+        dict: Processed feature arrays ready for sequence creation
+            - X_continuous: (n_days, n_continuous) scaled session-aware features
+            - X_categorical: (n_days, n_categorical) encoded categorical features
+            - user_ids: (n_days,) user ID per day
+            - dates: (n_days,) datetime64 per day
+            
+    Note:
+        This function ensures inference uses identical preprocessing as training,
+        critical for consistent model predictions on session-aware features.
     """
     scalable_cols = artifacts['scalable_columns']
     cyclical_cols = artifacts['cyclical_columns']
@@ -1029,23 +1035,38 @@ def _apply_event_date_filter(conn, db_path, date_range, config):
 
 def run_inference_feature_engineering(db_path, config, artifacts,
                                       user_filter=None, date_range=None):
-    """Run the full feature engineering pipeline for inference and return arrays.
-
-    Reuses the same SQL stages as training but applies saved scaler/mappings
-    instead of fitting new ones.
-
+    """
+    Run session-aware feature engineering pipeline for real-time inference.
+    
+    Reuses the same SQL stages as training (daily aggregation + session detection)
+    but applies saved preprocessing artifacts instead of fitting new ones.
+    Supports date range filtering for incremental scoring and user filtering
+    for targeted analysis.
+    
+    Pipeline Stages:
+    1. Filter events by date range (if specified)
+    2. Daily aggregation with activity counts
+    3. Session detection and per-session features
+    4. Merge session statistics into daily table
+    5. Enrich with static features (users, psychometric, changes)
+    6. Compute derived features and transformations
+    7. Apply saved scaling and encoding artifacts
+    
     Args:
-        db_path: path to the DuckDB database with raw events.
-        config: config dict.
-        artifacts: dict from preprocessing_artifacts.pkl.
-        user_filter: optional list of user IDs to restrict to.
-        date_range: optional (start_date, end_date) strings in 'YYYY-MM-DD'
-            format.  When provided, only events within this window are
-            processed.  The lookback period is automatically extended so
-            rolling statistics and sequences have enough history.
-
+        db_path: Path to DuckDB database with raw events and session data
+        config: Configuration dict with feature definitions
+        artifacts: Preprocessing artifacts dict (scaler, mappings, metadata)
+        user_filter: Optional list of user IDs to restrict analysis to
+        date_range: Optional (start_date, end_date) tuple in 'YYYY-MM-DD' format.
+                   When provided, only events within this window are processed.
+                   Lookback period automatically extended for rolling stats.
+    
     Returns:
-        dict with X_continuous, X_categorical, user_ids, dates arrays.
+        dict: Feature arrays for inference
+            - X_continuous: (n_days, n_continuous) session-aware features
+            - X_categorical: (n_days, n_categorical) categorical features  
+            - user_ids: (n_days,) user ID per day
+            - dates: (n_days,) datetime64 per day
     """
     conn = duckdb.connect()
     conn.execute(f"ATTACH '{db_path}' AS src (READ_ONLY)")
