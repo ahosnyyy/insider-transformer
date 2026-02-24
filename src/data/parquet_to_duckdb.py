@@ -1,8 +1,21 @@
 """
 Parquet to DuckDB Ingestion
 ===========================
-Load Parquet files into DuckDB for SQL-based feature engineering.
-Creates unified events table, users table, and labels table.
+Load Parquet files into DuckDB database for SQL-based feature engineering.
+Creates 7 tables with proper indexing and relationships:
+
+Core Tables:
+- events: Unified activity logs (logon, device, email, file, http)
+- users: Latest LDAP record per user with role/department info
+- insiders: Ground truth labels with threat scenarios and time windows
+
+Derived Tables:
+- user_changes: Monthly role/department/functional_unit changes
+- terminated_users: Users who disappeared between LDAP snapshots
+- psychometric: Big Five personality scores per user
+- functional_unit_encoding: Mapping of functional units to integer codes
+
+Output: data/processed/insider.duckdb ready for feature engineering
 """
 
 import os
@@ -37,7 +50,23 @@ def create_database(config: dict) -> duckdb.DuckDBPyConnection:
 
 
 def create_events_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path):
-    """Create unified events table from all activity Parquet files."""
+    """
+    Create unified events table from all activity Parquet files.
+    
+    Normalizes different activity types into a single schema:
+    - Common fields: id, datetime, user_id, pc, activity
+    - Activity-specific fields: to_addr, attachments (email), url (http), 
+      filename (file), content (file/http)
+    
+    Creates index on (user_id, datetime) for fast session queries.
+    
+    Args:
+        conn: DuckDB connection
+        parquet_dir: Directory containing activity parquet files
+        
+    Returns:
+        Total number of events ingested
+    """
     print("\n--- Creating events table ---")
     
     # Build SQL dynamically based on which parquet files exist
@@ -168,7 +197,20 @@ def create_events_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path):
 
 
 def create_users_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path):
-    """Create users table from LDAP data (latest record per user)."""
+    """
+    Create users table from LDAP data, keeping only the latest record per user.
+    
+    LDAP parquet contains all monthly snapshots merged. Uses ROW_NUMBER() to
+    identify the most recent record for each user (ordered by user_id DESC as
+    a proxy for recency since we don't have explicit timestamps).
+    
+    Args:
+        conn: DuckDB connection
+        parquet_dir: Directory containing ldap.parquet
+        
+    Returns:
+        Number of unique users
+    """
     print("\n--- Creating users table ---")
     
     sql = f"""
@@ -315,7 +357,16 @@ def create_user_changes_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path
     """
     Detect role/department/functional_unit changes across LDAP monthly snapshots.
     
-    Creates a table with one row per user per month where any change occurred.
+    Processes raw LDAP CSV files (not the merged parquet) to preserve month information.
+    Uses LAG() window function to compare current month with previous month for each user.
+    Creates binary flags (1/0) for each type of change.
+    
+    Args:
+        conn: DuckDB connection
+        parquet_dir: Directory containing parquet files (not used for this table)
+        
+    Returns:
+        Total number of user-month change records
     """
     print("\n--- Creating user_changes table ---")
     
@@ -404,6 +455,17 @@ def create_user_changes_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path
 def create_terminated_users_table(conn: duckdb.DuckDBPyConnection, parquet_dir: Path):
     """
     Detect terminated users — those who disappear from LDAP between consecutive months.
+    
+    Compares each pair of consecutive monthly LDAP files. Users present in month N
+    but absent in month N+1 are marked as terminated in month N+1. Takes the earliest
+    termination month per user (handles cases where user disappears for good).
+    
+    Args:
+        conn: DuckDB connection
+        parquet_dir: Directory containing parquet files (not used for this table)
+        
+    Returns:
+        Number of terminated users detected
     """
     print("\n--- Creating terminated_users table ---")
     
@@ -485,7 +547,21 @@ def print_summary(conn: duckdb.DuckDBPyConnection):
 
 
 def main():
-    """Main entry point for Parquet to DuckDB ingestion."""
+    """
+    Create DuckDB database with all tables needed for feature engineering.
+    
+    Database Structure:
+    1. events - Unified activity logs (32M+ records)
+    2. users - User profiles from latest LDAP
+    3. insiders - Ground truth threat labels
+    4. user_changes - Monthly role/department changes
+    5. terminated_users - Employee termination dates
+    6. psychometric - Big Five personality scores
+    7. functional_unit_encoding - Lookup table
+    
+    Creates indexes and prints summary statistics.
+    Output: data/processed/insider.duckdb
+    """
     config = load_config()
     
     project_root = Path(__file__).parent.parent.parent
@@ -502,20 +578,22 @@ def main():
         print("\nERROR: Parquet files not found. Run csv_to_parquet.py first.")
         sys.exit(1)
     
-    # Create database
+    # Create fresh database
     conn = create_database(config)
     
     try:
-        # Create tables
-        create_events_table(conn, parquet_dir)
-        create_users_table(conn, parquet_dir)
-        create_labels_table(conn, raw_dir)
-        create_feature_encoding_tables(conn, config)
-        create_psychometric_table(conn, parquet_dir)
-        create_user_changes_table(conn, parquet_dir)
-        create_terminated_users_table(conn, parquet_dir)
+        # Core tables for feature engineering
+        create_events_table(conn, parquet_dir)           # Activity logs
+        create_users_table(conn, parquet_dir)             # User profiles
+        create_labels_table(conn, raw_dir)                # Insider labels
         
-        # Print summary
+        # Derived tables for context features
+        create_feature_encoding_tables(conn, config)       # Encodings lookup
+        create_psychometric_table(conn, parquet_dir)       # Personality scores
+        create_user_changes_table(conn, parquet_dir)       # Role changes
+        create_terminated_users_table(conn, parquet_dir)    # Termination dates
+        
+        # Print database summary
         print_summary(conn)
         
         print("\n" + "=" * 60)

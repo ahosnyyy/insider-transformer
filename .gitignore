@@ -16,11 +16,6 @@ outputs/logs/
 *.pth
 *.ckpt
 
-# Documentation (if auto-generated)
-docs/
-docs/_build/
-docs/.doctrees/
-
 # Python cache
 __pycache__/
 *.py[cod]

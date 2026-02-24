@@ -1,13 +1,20 @@
 """
-Sequence Creation Module — Daily Version
-======================================
-Creates daily sequences for Transformer autoencoder.
+Sequence Creation Module — Session-Aware Daily Features
+=======================================================
+Creates 60-day sliding window sequences from session-aware daily features.
+
+User-based splitting ensures no data leakage:
+- Normal users: 70% train, 15% val, 15% test
+- Insider users: 100% test (never seen during training)
 
 Produces per split:
-  - X_{split}_continuous.npy: (n_sequences, 60, n_continuous_features)
-  - X_{split}_categorical.npy: (n_sequences, 60, n_categorical_features)
-  - y_{split}.npy: (n_sequences,) binary labels
+  - X_{split}_continuous.npy: (n_sequences, 60, ~52 features)
+    Daily activity counts + session-derived features + interactions
+  - X_{split}_categorical.npy: (n_sequences, 60, 5 features)
+    User, PC, role, department, functional_unit embeddings
+  - y_{split}.npy: (n_sequences,) binary labels (0=normal, 1=insider)
   - dates_{split}.npy: (n_sequences,) datetime64 — last date per sequence
+  - user_ids_{split}.npy: (n_sequences,) user ID per sequence
 """
 
 import gc
@@ -27,13 +34,21 @@ except (ImportError, ValueError):
 
 
 def split_users(user_ids, labels, config):
-    """Deterministically split users into train/val/test sets.
-
-    Normal users are shuffled with seed=42 and split by config ratios.
-    Insider users always go to the test set.
-
+    """
+    Deterministically split users into train/val/test sets.
+    
+    Splitting Strategy:
+    - Normal users: Randomly shuffled (seed=42) then split 70/15/15
+    - Insider users: ALL go to test set (never seen during training)
+    - Ensures no data leakage between splits
+    
+    Args:
+        user_ids: Array of user IDs per day
+        labels: Array of binary labels per day (0=normal, 1=insider)
+        config: Config dict with split ratios
+        
     Returns:
-        (train_users, val_users, test_normal_users, insider_users) — each a set
+        Tuple of sets: (train_users, val_users, test_normal_users, insider_users)
     """
     unique_users = np.unique(user_ids)
     insider_users = set(np.unique(user_ids[labels == 1]))
@@ -55,16 +70,29 @@ def split_users(user_ids, labels, config):
 
 def create_sequences_for_user(user_cont, user_cat, user_labels,
                                lookback, stride, user_dates=None):
-    """Create sliding window sequences for a single user.
-
+    """
+    Create sliding window sequences for a single user.
+    
+    Sequence Creation:
+    - Sliding windows of length 'lookback' (default: 60 days)
+    - Stride of 5 days between windows (overlap allowed)
+    - Zero-padding for users with <60 active days
+    - Binary label: 1 if any day in window is insider, else 0
+    
     Args:
-        user_dates: optional 1-D array of datetime64 per day.
-            When provided the function also returns the last date
-            of each sequence (the "sequence end date").
-
+        user_cont: (n_days, n_continuous) continuous features
+        user_cat: (n_days, n_categorical) categorical features
+        user_labels: (n_days,) binary labels per day
+        lookback: Window length in days (default: 60)
+        stride: Step between windows (default: 5)
+        user_dates: optional (n_days,) datetime64 per day
+        
     Returns:
-        (seqs_c, seqs_cat, seqs_y) or (seqs_c, seqs_cat, seqs_y, seqs_dates)
-        when user_dates is supplied.
+        Tuple of arrays:
+        - sequences_cont: (n_seqs, lookback, n_continuous)
+        - sequences_cat: (n_seqs, lookback, n_categorical)
+        - sequence_labels: (n_seqs,) binary labels
+        - sequence_dates: (n_seqs,) end dates (if user_dates provided)
     """
     n = len(user_cont)
     has_dates = user_dates is not None

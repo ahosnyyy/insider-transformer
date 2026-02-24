@@ -1,8 +1,16 @@
 """
 CSV to Parquet Converter
 ========================
-Converts large CSV files to Parquet format for efficient storage and processing.
-Handles the 14GB+ HTTP logs using true chunked/streaming processing.
+Converts CERT R4.2 CSV files to Parquet format for efficient storage and processing.
+Handles large files (14GB+ HTTP logs) using true chunked/streaming processing to avoid
+memory issues. Processes activity logs, LDAP snapshots, and psychometric data.
+
+Key Features:
+- Streaming conversion for files >1GB (HTTP logs)
+- Standard conversion for smaller files
+- Merges LDAP monthly snapshots into single file
+- Preserves data types and compression (Snappy)
+- Outputs to data/parquet/ for DuckDB ingestion
 """
 
 import os
@@ -28,17 +36,18 @@ def convert_csv_to_parquet_chunked(
     chunk_size_mb: int = 128
 ) -> int:
     """
-    Convert a large CSV file to Parquet using streaming/chunked processing.
+    Convert CSV file to Parquet, automatically choosing streaming or standard method.
     
-    This uses PyArrow's streaming reader to avoid loading entire file in memory.
+    For files >1GB, uses PyArrow streaming reader to process in chunks without
+    loading entire file into memory. For smaller files, uses standard conversion.
     
     Args:
-        csv_path: Path to input CSV file
-        parquet_path: Path to output Parquet file
-        chunk_size_mb: Block size in MB for streaming read
+        csv_path: Path to input CSV file (e.g., data/raw/http.csv)
+        parquet_path: Path to output Parquet file (e.g., data/parquet/http.parquet)
+        chunk_size_mb: Block size in MB for streaming read (default: 128MB)
         
     Returns:
-        Total number of rows converted
+        Total number of rows converted (0 if error)
     """
     print(f"\nConverting: {csv_path.name}")
     file_size_gb = csv_path.stat().st_size / 1e9
@@ -139,8 +148,18 @@ def convert_large_csv_streaming(
 
 def convert_ldap_files(raw_dir: Path, parquet_dir: Path) -> int:
     """
-    Merge all LDAP monthly files into a single Parquet file.
-    Takes the latest record per user.
+    Merge all LDAP monthly snapshot files into a single Parquet file.
+    
+    Each CSV file represents a monthly snapshot of all users. This function
+    concatenates all snapshots into one file. Deduplication (taking latest record
+    per user) is handled later in DuckDB during table creation.
+    
+    Args:
+        raw_dir: Directory containing LDAP/ subfolder with monthly CSVs
+        parquet_dir: Output directory for merged ldap.parquet file
+        
+    Returns:
+        Total number of LDAP records (including duplicates across months)
     """
     ldap_dir = raw_dir / "LDAP"
     if not ldap_dir.exists():
@@ -173,7 +192,17 @@ def convert_ldap_files(raw_dir: Path, parquet_dir: Path) -> int:
 
 
 def main():
-    """Main entry point for CSV to Parquet conversion."""
+    """
+    Convert all CERT R4.2 CSV files to Parquet format.
+    
+    Processes files in order (small to large) to optimize memory usage:
+    1. Activity logs: logon, device, email, file
+    2. HTTP logs (14GB+ - uses streaming)
+    3. LDAP monthly snapshots (merged)
+    4. Psychometric assessment data
+    
+    Outputs to data/parquet/ directory with Snappy compression.
+    """
     config = load_config()
     
     # Setup paths
@@ -190,13 +219,13 @@ def main():
     print(f"Input:  {raw_dir}")
     print(f"Output: {parquet_dir}")
     
-    # Files to convert (order matters - small files first)
+    # Files to convert (order matters - small files first to optimize memory)
     csv_files = [
-        "logon.csv",
-        "device.csv", 
-        "email.csv",
-        "file.csv",
-        "http.csv",  # Large file ~14GB - processed last with streaming
+        "logon.csv",      # User login/logout events
+        "device.csv",     # Device connect/disconnect events
+        "email.csv",      # Email activity with attachments
+        "file.csv",       # File copy operations
+        "http.csv",       # Web requests (14GB+ - requires streaming)
     ]
     
     total_rows = 0

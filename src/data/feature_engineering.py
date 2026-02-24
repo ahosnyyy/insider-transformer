@@ -1,15 +1,47 @@
 """
-Feature Engineering — Hybrid Session → Daily Aggregation
-=========================================================
+Feature Engineering — Session-Aware Daily Aggregation
+====================================================
 All heavy computation in DuckDB SQL. No pandas. Only numpy for final export.
 
 Stages:
   1a. Daily aggregation from events (GROUP BY user_id, date)
-  1b. Session detection (Logon/Logoff pairing) + per-session features
-  1c. Daily aggregation of session features → merge into daily table
-  2.  Enrich with static features (users, psychometric, LDAP changes, labels)
-  3.  Derived features + log1p + z-scores + rolling stats + cyclical encoding
-  4.  StandardScaler in numpy + export arrays
+      - Activity counts: HTTP, email, file, device, logon events
+      - Intra-day structure: sessions, active hours, after-hours ratio
+      - PC usage: distinct PCs, most common PC
+
+  1b. Session detection and per-session features
+      - Pair Logon/Logoff events per user per PC per day
+      - Handle edge cases: missing logoff, multiple logons, overnight sessions
+      - Compute per-session: duration, event counts, entropy, timing
+
+  1c. Daily aggregation of session features
+      - Session count, duration stats, timing stats
+      - Behavior stats: event counts, entropy
+      - Interaction features: USB+after-hours, email+attachments
+
+  1d. Merge session statistics into daily table
+      - LEFT JOIN session features onto daily aggregation
+      - Preserves all daily records, adds session context
+
+  2.  Enrich with static features
+      - User profiles: role, department, functional_unit
+      - Psychometric scores: Big Five personality traits
+      - LDAP changes: role/department changes per month
+      - Terminations: employee termination dates
+      - Insider labels: ground truth threat scenarios
+
+  3.  Derived features and transformations
+      - log1p transform on all count features (handles skewness)
+      - Interaction features: cross-feature products
+      - Cyclical encoding: day of week sin/cos
+      - Binary flags: weekend, role changes, termination
+      - Per-user z-scores and 20-day rolling stats
+
+  4.  Scaling and export
+      - StandardScaler fitted on training users only
+      - Export continuous and categorical arrays separately
+      - Save preprocessing artifacts (scaler, label mappings)
+      - Output: ~52 continuous + 5 categorical features per day
 """
 
 import gc
@@ -37,7 +69,17 @@ except (ImportError, ValueError):
 # =========================================================================
 
 def _create_daily_aggregation(conn):
-    """Aggregate events to daily features per user."""
+    """
+    Create daily aggregation table with activity counts and intra-day structure.
+    
+    Computes 18 daily features:
+    - Activity counts: HTTP requests, emails, file copies, USB connections
+    - Intra-day metrics: sessions, active hours, after-hours ratio
+    - PC usage: distinct PCs, most common PC
+    
+    Args:
+        conn: DuckDB connection with events table
+    """
     print("\n[Stage 1] Creating daily aggregation...")
 
     sql = """
@@ -145,14 +187,23 @@ def _create_daily_aggregation(conn):
 # =========================================================================
 
 def _create_sessions_table(conn):
-    """Detect sessions by pairing Logon/Logoff events per user per PC.
-
-    Edge cases handled:
-      - Missing Logoff → end session at next Logon or end of day
-      - Multiple Logons without Logoff → each starts a new session
-      - Logoff without prior Logon → ignored (orphan)
-      - Overnight sessions → assigned to start date
-      - Duration capped at 720 minutes (12 hours)
+    """
+    Detect sessions by pairing Logon/Logoff events per user per PC.
+    
+    Session Definition:
+    - Starts with Logon event
+    - Ends with Logoff event OR next Logon OR end of day
+    - Maximum duration: 12 hours (capped for outliers)
+    
+    Edge Cases Handled:
+    - Missing Logoff: End session at next Logon or day end
+    - Multiple Logons: Each Logon starts new session (implicit logoff)
+    - Orphan Logoff: Ignored (no matching Logon)
+    - Overnight sessions: Assigned to start date
+    - Very long sessions: Capped at 12 hours for feature computation
+    
+    Args:
+        conn: DuckDB connection with events table
     """
     print("\n[Stage 1b] Detecting sessions from Logon/Logoff events...")
 
@@ -1053,6 +1104,32 @@ def _persist_sessions(conn, db_path):
 # =========================================================================
 
 def run_feature_engineering() -> Path:
+    """
+    Run complete session-aware feature engineering pipeline.
+    
+    Pipeline Stages:
+    1. Daily aggregation from events (18 features)
+    2. Session detection and per-session features
+    3. Daily aggregation of session features (18 features)
+    4. Merge session stats into daily table
+    5. Enrich with static features (users, psychometric, changes)
+    6. Compute derived features and transformations
+    7. Scale features and export to numpy arrays
+    
+    Args:
+        None (uses config.yaml for paths and settings)
+        
+    Returns:
+        Path: Output directory containing feature arrays and artifacts
+        
+    Output Files:
+        - X_continuous.npy: (n_days, n_continuous_features)
+        - X_categorical.npy: (n_days, n_categorical_features)
+        - y.npy: (n_days,) binary labels
+        - dates.npy: (n_days,) datetime64
+        - user_ids.npy: (n_days,) user IDs
+        - preprocessing_artifacts.pkl: scaler, mappings, metadata
+    """
     config = load_config()
     project_root = Path(__file__).parent.parent.parent
 
@@ -1066,12 +1143,25 @@ def run_feature_engineering() -> Path:
     conn.execute("SET threads = 4")
 
     try:
+        # Stage 1: Daily aggregation from raw events
         _create_daily_aggregation(conn)
+        
+        # Stage 1b: Session detection from logon/logoff events
         _create_sessions_table(conn)
+        
+        # Stage 1c: Per-session feature computation
         _compute_session_features(conn)
+        
+        # Stage 1d: Merge session stats into daily table
         _merge_session_stats(conn)
+        
+        # Stage 2: Enrich with static features (users, psychometric, changes)
         _enrich_daily(conn)
+        
+        # Stage 3: Compute derived features and transformations
         _compute_features(conn, config)
+        
+        # Stage 4: Scale features and export to numpy arrays
         _scale_and_export(conn, config, output_dir)
 
         # Persist sessions table to source DuckDB for evaluation

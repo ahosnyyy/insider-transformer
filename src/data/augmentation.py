@@ -1,13 +1,22 @@
 """
-Data Augmentation Module — Daily Version
-======================================
+Data Augmentation Module — Session-Aware Daily Features
+======================================================
 Applies augmentation strategies to insider sequences in the test set.
 
-Strategies (adapted for daily features):
-  - jittering: Gaussian noise on continuous features
+Purpose: Increase robustness of model to variations in insider behavior patterns
+         and improve generalization to unseen threat scenarios.
+
+Strategies (adapted for session-aware daily features):
+  - jittering: Add Gaussian noise to continuous features
+    Helps model handle natural variation in user behavior
   - feature_dropout: Randomly zero out 10% of continuous features
+    Simulates missing or incomplete log data
   - scaling: Multiply continuous features by random factor [0.9, 1.1]
-  - time_warping: Not applicable for daily (no time_since_last_event)
+    Accounts for different activity volume baselines
+  - time_warping: Not applicable for daily aggregated features
+
+Note: Only insider sequences are augmented (5 copies each) to balance the dataset
+      while preserving all normal user patterns unchanged.
 """
 
 import numpy as np
@@ -19,14 +28,19 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 def jittering(X: np.ndarray, noise_std: float = 0.05, rng: np.random.Generator = None) -> np.ndarray:
-    """Add Gaussian noise to continuous features.
-
+    """
+    Add Gaussian noise to continuous features.
+    
+    Noise is scaled relative to each feature's standard deviation across the dataset,
+    ensuring consistent augmentation across features with different scales.
+    
     Args:
-        X: (n_sequences, seq_len, n_features)
-        noise_std: Noise std relative to feature std
-        rng: numpy random generator
+        X: (n_sequences, seq_len, n_features) continuous features
+        noise_std: Noise standard deviation as fraction of feature std (default: 0.05)
+        rng: numpy random generator for reproducibility
+        
     Returns:
-        Augmented X
+        X_aug: (n_sequences, seq_len, n_features) augmented features
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -35,14 +49,19 @@ def jittering(X: np.ndarray, noise_std: float = 0.05, rng: np.random.Generator =
 
 
 def feature_dropout(X: np.ndarray, dropout_rate: float = 0.1, rng: np.random.Generator = None) -> np.ndarray:
-    """Randomly zero out continuous features.
-
+    """
+    Randomly zero out continuous features to simulate missing data.
+    
+    Applies the same mask across all timesteps for each feature, maintaining
+    temporal consistency while simulating feature unavailability.
+    
     Args:
-        X: (n_sequences, seq_len, n_features)
-        dropout_rate: Fraction of features to zero out
-        rng: numpy random generator
+        X: (n_sequences, seq_len, n_features) continuous features
+        dropout_rate: Fraction of features to zero out (default: 0.1 = 10%)
+        rng: numpy random generator for reproducibility
+        
     Returns:
-        Augmented X
+        X_aug: (n_sequences, seq_len, n_features) with masked features
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -51,14 +70,19 @@ def feature_dropout(X: np.ndarray, dropout_rate: float = 0.1, rng: np.random.Gen
 
 
 def scaling(X: np.ndarray, scale_range: List[float] = [0.9, 1.1], rng: np.random.Generator = None) -> np.ndarray:
-    """Multiply continuous features by random factor.
-
+    """
+    Multiply continuous features by random factor to simulate activity level variations.
+    
+    Simulates different user baselines (e.g., high-activity vs low-activity users)
+    or temporal changes in overall behavior patterns.
+    
     Args:
-        X: (n_sequences, seq_len, n_features)
-        scale_range: [min, max] for scaling factor
-        rng: numpy random generator
+        X: (n_sequences, seq_len, n_features) continuous features
+        scale_range: [min, max] range for scaling factor (default: [0.9, 1.1])
+        rng: numpy random generator for reproducibility
+        
     Returns:
-        Augmented X
+        X_aug: (n_sequences, seq_len, n_features) scaled features
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -70,18 +94,27 @@ def augment_sequences(X_cont: np.ndarray, X_cat: np.ndarray, y: np.ndarray,
                     config: dict, rng: Optional[np.random.Generator] = None,
                     user_ids: Optional[np.ndarray] = None,
                     dates: Optional[np.ndarray] = None) -> tuple:
-    """Apply enabled augmentation strategies to insider sequences.
-
+    """
+    Apply enabled augmentation strategies to insider sequences only.
+    
+    Process:
+    1. Identify insider sequences (y == 1)
+    2. Create N augmented copies (default: 5) per insider sequence
+    3. Apply all enabled strategies (jittering, dropout, scaling)
+    4. Concatenate with original sequences
+    
     Args:
-        X_cont: (n_sequences, seq_len, n_continuous)
-        X_cat: (n_sequences, seq_len, n_categorical)
-        y: (n_sequences,) labels
-        config: config dict with augmentation settings
-        rng: numpy random generator
+        X_cont: (n_sequences, seq_len, n_continuous) continuous features
+        X_cat: (n_sequences, seq_len, n_categorical) categorical features
+        y: (n_sequences,) binary labels (0=normal, 1=insider)
+        config: Config dict with augmentation settings and multiplier
+        rng: numpy random generator for reproducibility
         user_ids: optional (n_sequences,) user IDs to augment in parallel
-        dates: optional (n_sequences,) or (n_sequences, seq_len) dates to augment in parallel
+        dates: optional (n_sequences,) sequence end dates to augment in parallel
+        
     Returns:
-        tuple of augmented arrays; user_ids_aug and dates_aug included if inputs provided
+        Tuple of augmented arrays in same order as inputs.
+        Includes user_ids_aug and dates_aug if provided.
     """
     if rng is None:
         rng = np.random.default_rng(42)

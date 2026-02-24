@@ -1,14 +1,26 @@
 #!/usr/bin/env python
 """
-02_feature_engineering.py — Feature Engineering Pipeline
+02_feature_engineering.py — Session-Aware Feature Engineering Pipeline
 
-Step 1: Extract daily features from DuckDB events
-Step 2: Create 60-day sequences
+Step 1: Extract session-aware daily features from DuckDB events
+        - Daily activity counts (18 features)
+        - Session detection and per-session statistics (18 features)
+        - Interaction, cyclical, and binary features (11 features)
+        - Personality traits and context features (5 features)
+        - Total: ~52 continuous features + 5 categorical embeddings
+
+Step 2: Create 60-day sliding window sequences
+        - User-based splitting (train/val/test = 70/15/15)
+        - Stride of 5 days between sequences
+        - Zero-padding for users with <60 active days
+
 Step 3: Augment insider test sequences (optional)
+        - Jittering: Gaussian noise on continuous features
+        - Feature dropout: Randomly zero 10% of features
+        - Scaling: Multiply by random factor [0.9, 1.1]
+        - Creates 5 augmented copies per insider sequence
 
-Usage:
-    conda activate insider-threat
-    python scripts/02_feature_engineering.py
+Output: models/<timestamp>/ with feature arrays and preprocessing artifacts
 """
 
 import sys
@@ -46,8 +58,9 @@ def main():
     print("INSIDER THREAT DETECTION — DAILY FEATURE ENGINEERING")
     print("=" * 70)
 
-    # Step 1: Feature extraction
-    print("\n[STEP 1/3] Daily feature extraction...")
+    # Step 1: Session-aware feature extraction
+    print("\n[STEP 1/3] Session-aware daily feature extraction...")
+    print("  Computing: daily counts + session features + interactions + context")
     t0 = time.time()
     try:
         output_dir = run_feature_engineering()
@@ -60,8 +73,9 @@ def main():
         print("\n--skip-sequences flag set, stopping here.")
         return
 
-    # Step 2: Sequence creation
+    # Step 2: Sequence creation with user-based splitting
     print("\n[STEP 2/3] Sequence creation (60-day windows, stride=5)...")
+    print("  Splitting: train/val/test = 70/15/15 (user-based)")
     t0 = time.time()
     try:
         run_sequence_creation()
@@ -70,9 +84,10 @@ def main():
         sys.exit(1)
     print(f"  Step 2 done in {time.time() - t0:.1f}s")
 
-    # Step 3: Augmentation
+    # Step 3: Insider sequence augmentation
     if not args.no_augment:
-        print("\n[STEP 3/3] Test set augmentation...")
+        print("\n[STEP 3/3] Test set augmentation (insider sequences only)...")
+        print("  Strategies: jittering, feature_dropout, scaling")
         t0 = time.time()
         try:
             from src.utils.common import load_config
