@@ -105,7 +105,7 @@ def main():
     print(f"DAILY FEATURE ENGINEERING COMPLETE! (total: {total:.1f}s / {total/60:.1f}m)")
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
-    print("Next step: Run scripts/03_train.py to train the Transformer model")
+    print("Next step: Run python scripts/03_train.py to train the Transformer model")
 
 
 if __name__ == "__main__":

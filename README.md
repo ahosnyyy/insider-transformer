@@ -30,6 +30,49 @@ Hybrid Session→Daily Transformer Autoencoder for insider threat detection on t
 | Stride | 5 days |
 | Features | ~52 continuous + 5 categorical (session-aware) |
 
+## Project Structure
+
+All scripts are **thin CLI wrappers** that parse arguments and delegate to core classes in `src/`:
+
+| Script | Core Module | Class |
+|--------|-------------|-------|
+| `scripts/03_train.py` | `src/training/trainer.py` | `Trainer` |
+| `scripts/04_evaluate.py` | `src/evaluation/evaluator.py` | `Evaluator` |
+| `scripts/05_plot.py` | `src/visualization/plotter.py` | `Plotter` |
+| `scripts/06_inference.py` | `src/inference/runner.py` | `InferenceRunner` |
+
+`scripts/01_prepare_data.py` and `scripts/02_feature_engineering.py` are also wrappers, calling functions from `src/data/`.
+
+```
+insider-transformer/
+├── config/
+│   └── config.yaml                    # Central configuration
+├── scripts/                           # Thin CLI wrappers (~40-80 lines each)
+│   ├── 01_prepare_data.py
+│   ├── 02_feature_engineering.py
+│   ├── 03_train.py
+│   ├── 04_evaluate.py
+│   ├── 05_plot.py
+│   └── 06_inference.py
+├── src/                               # Core logic
+│   ├── data/                          # Data loading, feature engineering, sequences, augmentation
+│   ├── models/                        # InsiderTransformerAE architecture
+│   ├── training/
+│   │   └── trainer.py                 # Trainer class (training loop, checkpointing, TensorBoard)
+│   ├── evaluation/
+│   │   ├── evaluator.py               # Evaluator class (scoring, thresholds, metrics, SOC report)
+│   │   ├── scoring.py                 # Anomaly scoring functions
+│   │   └── helpers.py                 # Evaluation utilities
+│   ├── visualization/
+│   │   └── plotter.py                 # Plotter class (11 publication-quality plots)
+│   ├── inference/
+│   │   └── runner.py                  # InferenceRunner class (feature eng → scoring → reports)
+│   └── utils/                         # Config loading, seeding, device selection
+├── data/                              # Raw + processed data
+├── outputs/                           # Checkpoints, scores, plots, reports
+└── docs/                              # Architecture and feature documentation
+```
+
 ## Pipeline
 
 ```
@@ -269,7 +312,7 @@ python scripts/05_plot.py --dry-run
 ### Outputs
 
 ```
-outputs/plots/                              ← All 10 PNG files
+outputs/plots/                              ← All 11 PNG files
 outputs/plots/detection_timeline_individual/ ← Individual per-user timeline plots
 ```
 

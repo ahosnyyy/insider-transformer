@@ -51,7 +51,7 @@ def main():
     print("\n" + "=" * 70)
     print("DATA PREPARATION COMPLETE!")
     print("=" * 70)
-    print("\nNext step: Run 02_feature_engineering.py to extract features")
+    print("\nNext step: Run python scripts/02_feature_engineering.py to extract features")
 
 
 if __name__ == "__main__":

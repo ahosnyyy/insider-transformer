@@ -1,422 +1,628 @@
 """
-Training Module
-================
-Training loop for LSTM-Autoencoder with TensorBoard logging.
+Training Module — InsiderTransformerAE
+=======================================
+Trainer class for the session-aware Transformer autoencoder.
 
-Key features:
-- Train on normal sequences only
-- MSE loss for reconstruction
-- Adam optimizer with paper's hyperparameters
-- Early stopping on validation loss
+Encapsulates all training logic:
+- Data loading (session-aware features)
+- Model creation with categorical embeddings
+- Training loop with AMP, gradient clipping, cosine LR schedule
+- Validation and test-set monitoring (AUC, AUPRC, latency)
+- Checkpointing (best, latest, final) and resume support
 - TensorBoard logging
+- Early stopping on validation loss
+
+Used by scripts/03_train.py as a thin CLI wrapper.
 """
 
-import os
-import sys
+import gc
+import json
+import pickle
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
+
 import numpy as np
 import torch
-import torch.nn as nn
+from sklearn.metrics import confusion_matrix, precision_recall_curve
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-import yaml
 from tqdm import tqdm
-import time
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from models.lstm_autoencoder import LSTMAutoencoder, create_model, count_parameters
-
-
-def load_config():
-    """Load configuration from config.yaml"""
-    config_path = Path(__file__).parent.parent.parent / "config" / "config.yaml"
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+from models.transformer import create_model, count_parameters
+from evaluation.scoring import score_dataset, compute_ranking_metrics
+from utils import load_config, set_seed, get_device
 
 
-def load_data(config: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load train, val, test data and labels."""
-    project_root = Path(__file__).parent.parent.parent
-    processed_dir = project_root / config['data']['processed_dir']
-    
-    X_train = np.load(processed_dir / "X_train.npy")
-    X_val = np.load(processed_dir / "X_val.npy")
-    X_test = np.load(processed_dir / "X_test.npy")
-    y_test = np.load(processed_dir / "y_test.npy")
-    
-    return X_train, X_val, X_test, y_test
+# =========================================================================
+# Standalone helpers (used by Trainer, but pure functions)
+# =========================================================================
+
+def full_reconstruction_loss(predictions, targets, behavioral_indices=None):
+    """MSE on all positions, optionally restricted to behavioral features.
+
+    Args:
+        predictions: (batch, seq_len, n_continuous)
+        targets:     (batch, seq_len, n_continuous)
+        behavioral_indices: optional (n_behavioral,) long tensor — feature indices for loss
+    Returns:
+        Scalar loss
+    """
+    if behavioral_indices is not None:
+        diff = (predictions[:, :, behavioral_indices] - targets[:, :, behavioral_indices]) ** 2
+    else:
+        diff = (predictions - targets) ** 2
+    return diff.mean()
 
 
-def create_dataloaders(
-    X_train: np.ndarray,
-    X_val: np.ndarray,
-    batch_size: int
-) -> Tuple[DataLoader, DataLoader]:
-    """Create PyTorch DataLoaders for training and validation."""
-    
-    # Convert to tensors
-    train_tensor = torch.FloatTensor(X_train)
-    val_tensor = torch.FloatTensor(X_val)
-    
-    # For autoencoder, target = input
-    train_dataset = TensorDataset(train_tensor, train_tensor)
-    val_dataset = TensorDataset(val_tensor, val_tensor)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
-    )
-    
-    return train_loader, val_loader
+def create_scheduler(optimizer, total_epochs, warmup_epochs, n_train_batches):
+    """Linear warmup + cosine decay."""
+    warmup_steps = warmup_epochs * n_train_batches
+    total_steps = total_epochs * n_train_batches
 
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# =========================================================================
+# Trainer
+# =========================================================================
 
 class Trainer:
     """
-    Trainer for LSTM-Autoencoder.
-    
+    Trainer for InsiderTransformerAE.
+
+    Manages the full training lifecycle: data loading, model creation,
+    training loop, validation, test monitoring, checkpointing, and resume.
+
     Args:
-        model: LSTM-Autoencoder model
-        config: Configuration dictionary
-        device: torch device (cuda or cpu)
+        config: Configuration dictionary (from config.yaml)
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        lr: Learning rate
+        patience: Early stopping patience
+        use_amp: Enable mixed precision training
+        eval_interval: Run test evaluation every N epochs
+        checkpoint_interval: Save latest checkpoint every N epochs
+        dry_run: If True, run 1 epoch with limited steps
+        dry_run_steps: Max batches per phase in dry run
+        resume: Resume from best_model.pt checkpoint
+        output_dir: Directory for outputs (checkpoints, logs, history)
+        data_dir: Directory containing feature arrays
     """
-    
+
     def __init__(
         self,
-        model: LSTMAutoencoder,
         config: dict,
-        device: torch.device
+        epochs: int,
+        batch_size: int,
+        lr: float,
+        patience: int = 20,
+        use_amp: bool = False,
+        eval_interval: int = 10,
+        checkpoint_interval: int = 10,
+        dry_run: bool = False,
+        dry_run_steps: int = 5,
+        resume: bool = False,
+        output_dir: Optional[Path] = None,
+        data_dir: Optional[Path] = None,
     ):
-        self.model = model.to(device)
         self.config = config
-        self.device = device
-        
-        # Paper hyperparameters
-        self.epochs = config['training']['epochs']
-        self.lr = config['training']['learning_rate']
-        self.batch_size = config['training']['batch_size']
-        
-        # Loss and optimizer
-        self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-        
-        # Setup output directory
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.patience = patience
+        self.use_amp = use_amp
+        self.eval_interval = eval_interval
+        self.checkpoint_interval = checkpoint_interval
+        self.dry_run = dry_run
+        self.dry_run_steps = dry_run_steps if dry_run else None
+        self.resume = resume
+
         project_root = Path(__file__).parent.parent.parent
-        self.output_dir = project_root / "outputs"
-        self.model_dir = self.output_dir / "models"
-        self.log_dir = self.output_dir / "logs"
-        self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # TensorBoard writer
-        self.writer = SummaryWriter(self.log_dir / f"run_{int(time.time())}")
-        
-        # Best model tracking
-        self.best_val_loss = float('inf')
-        self.best_epoch = 0
-    
-    def train_epoch(self, train_loader: DataLoader, epoch: int = None, total_epochs: int = None) -> float:
-        """Train for one epoch. Returns average loss."""
-        self.model.train()
+        self.data_dir = data_dir or project_root / config['data']['processed_dir']
+        self.output_dir = output_dir or project_root / 'outputs'
+        if self.dry_run:
+            self.epochs = 1
+            self.output_dir = self.output_dir / 'dry_run'
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.weight_decay = config['training'].get('weight_decay', 0.01)
+        self.clip_norm = config['training'].get('clip_grad_norm', 1.0)
+        self.seed = config['training'].get('seed', 42)
+        self.warmup_epochs = config['training'].get('warmup_epochs', 5)
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def _load_train_val(self):
+        """Load training and validation datasets."""
+        d = self.data_dir
+        X_train_cont = np.load(d / 'X_train_continuous.npy')
+        X_train_cat = np.load(d / 'X_train_categorical.npy')
+        X_val_cont = np.load(d / 'X_val_continuous.npy')
+        X_val_cat = np.load(d / 'X_val_categorical.npy')
+
+        print(f"  Train: {X_train_cont.shape[0]:,} sequences, "
+              f"cont={X_train_cont.shape}, cat={X_train_cat.shape}")
+        print(f"  Val:   {X_val_cont.shape[0]:,} sequences, "
+              f"cont={X_val_cont.shape}, cat={X_val_cat.shape}")
+
+        train_dataset = TensorDataset(
+            torch.tensor(X_train_cont, dtype=torch.float32),
+            torch.tensor(X_train_cat, dtype=torch.long),
+        )
+        val_dataset = TensorDataset(
+            torch.tensor(X_val_cont, dtype=torch.float32),
+            torch.tensor(X_val_cat, dtype=torch.long),
+        )
+
+        del X_train_cont, X_train_cat, X_val_cont, X_val_cat
+        gc.collect()
+        return train_dataset, val_dataset
+
+    def _load_test(self):
+        """Load test set for monitoring."""
+        d = self.data_dir
+        X_test_cont = np.load(d / 'X_test_continuous.npy')
+        X_test_cat = np.load(d / 'X_test_categorical.npy')
+        y_test = np.load(d / 'y_test.npy')
+        user_ids_test = np.load(d / 'user_ids_test.npy', allow_pickle=True)
+
+        ts_path = d / 'dates_test.npy'
+        timestamps_test = np.load(ts_path, allow_pickle=True) if ts_path.exists() else None
+
+        dataset = TensorDataset(
+            torch.tensor(X_test_cont, dtype=torch.float32),
+            torch.tensor(X_test_cat, dtype=torch.long),
+        )
+        return dataset, y_test, user_ids_test, timestamps_test
+
+    # ------------------------------------------------------------------
+    # Model setup helpers
+    # ------------------------------------------------------------------
+
+    def _get_cat_cardinalities(self):
+        """Get cardinality for each categorical feature from preprocessing artifacts."""
+        with open(self.data_dir / 'preprocessing_artifacts.pkl', 'rb') as f:
+            artifacts = pickle.load(f)
+
+        cat_names = self.config['features']['categorical']
+        label_mappings = artifacts.get('label_mappings', {})
+
+        cardinalities = {}
+        for name in cat_names:
+            if name not in label_mappings:
+                raise KeyError(
+                    f"Categorical feature '{name}' not found in label_mappings. "
+                    f"Available: {list(label_mappings.keys())}. "
+                    f"Re-run feature engineering."
+                )
+            cardinalities[name] = len(label_mappings[name])
+
+        print(f"  Categorical cardinalities: {cardinalities}")
+        return cardinalities
+
+    def _get_behavioral_indices(self):
+        """Compute indices of behavioral (non-context-only) continuous features.
+
+        Returns None if no context_only features are configured.
+        """
+        context_only = self.config.get('features', {}).get('context_only', [])
+        if not context_only:
+            return None
+
+        with open(self.data_dir / 'preprocessing_artifacts.pkl', 'rb') as f:
+            artifacts = pickle.load(f)
+
+        continuous_columns = artifacts['continuous_columns']
+        context_set = set(context_only)
+
+        missing = context_set - set(continuous_columns)
+        if missing:
+            raise ValueError(
+                f"context_only features not found in continuous_columns: {missing}. "
+                f"Available: {continuous_columns}"
+            )
+
+        behavioral = [i for i, col in enumerate(continuous_columns) if col not in context_set]
+
+        excluded = [col for col in continuous_columns if col in context_set]
+        print(f"  Context-only features excluded from loss: {excluded}")
+        print(f"  Behavioral features: {len(behavioral)}/{len(continuous_columns)}")
+        return behavioral
+
+    # ------------------------------------------------------------------
+    # Train / Validate (single epoch)
+    # ------------------------------------------------------------------
+
+    def _train_epoch(self, model, loader, optimizer, scheduler, scaler, device, writer, epoch):
+        """Train for one epoch with optional AMP."""
+        model.train()
         total_loss = 0.0
-        
-        # Batch-level progress bar
-        if epoch and total_epochs:
-            desc = f"Epoch {epoch}/{total_epochs}"
-        elif epoch:
-            desc = f"Epoch {epoch}"
-        else:
-            desc = "Training"
-        pbar = tqdm(train_loader, desc=desc, leave=False, unit="batch")
-        
-        for batch_x, _ in pbar:
-            batch_x = batch_x.to(self.device)
-            
-            # Forward pass
-            self.optimizer.zero_grad()
-            reconstructed = self.model(batch_x)
-            loss = self.criterion(reconstructed, batch_x)
-            
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += loss.item() * batch_x.size(0)
-            
-            # Update progress bar with current loss
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        return total_loss / len(train_loader.dataset)
-    
-    def validate(self, val_loader: DataLoader) -> Tuple[float, dict]:
-        """Validate model. Returns average loss and reconstruction error stats."""
-        self.model.eval()
-        total_loss = 0.0
-        all_errors = []
-        
-        with torch.no_grad():
-            for batch_x, _ in val_loader:
-                batch_x = batch_x.to(self.device)
-                reconstructed = self.model(batch_x)
-                loss = self.criterion(reconstructed, batch_x)
-                total_loss += loss.item() * batch_x.size(0)
-                
-                # Calculate per-sample reconstruction errors
-                errors = self.model.get_reconstruction_error(batch_x)
-                all_errors.append(errors.cpu().numpy())
-        
-        all_errors = np.concatenate(all_errors)
-        
-        recon_stats = {
-            'mean': float(np.mean(all_errors)),
-            'std': float(np.std(all_errors)),
-            'min': float(np.min(all_errors)),
-            'max': float(np.max(all_errors)),
-            'p95': float(np.percentile(all_errors, 95)),
-            'p99': float(np.percentile(all_errors, 99)),
-        }
-        
-        return total_loss / len(val_loader.dataset), recon_stats
-    
-    def save_checkpoint(self, epoch: int, val_loss: float, is_best: bool = False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'val_loss': val_loss,
-            'config': self.config
-        }
-        
-        # Save latest
-        torch.save(checkpoint, self.model_dir / "checkpoint_latest.pt")
-        
-        # Save best
-        if is_best:
-            torch.save(checkpoint, self.model_dir / "checkpoint_best.pt")
-    
-    def evaluate_test(
-        self, 
-        X_test: np.ndarray, 
-        y_test: np.ndarray,
-        batch_size: int = 256
-    ) -> dict:
-        """
-        Evaluate on test set for MONITORING ONLY.
-        
-        This does NOT influence training decisions (model selection uses val loss).
-        Metrics are logged to TensorBoard under 'TestMonitor/'.
-        
-        Returns:
-            Dictionary of test metrics
-        """
-        from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
-        
-        self.model.eval()
-        errors = []
-        
-        with torch.no_grad():
-            for i in range(0, len(X_test), batch_size):
-                batch = torch.FloatTensor(X_test[i:i + batch_size]).to(self.device)
-                error = self.model.get_reconstruction_error(batch)
-                errors.append(error.cpu().numpy())
-        
-        errors = np.concatenate(errors)
-        
-        # Find threshold (using F1-maximizing on this test set - for monitoring only)
-        thresholds = np.percentile(errors, np.linspace(80, 99.9, 50))
-        best_f1 = 0
-        best_threshold = thresholds[0]
-        
-        for threshold in thresholds:
-            y_pred = (errors > threshold).astype(int)
-            if y_pred.sum() > 0:
-                f1 = f1_score(y_test, y_pred, zero_division=0)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_threshold = threshold
-        
-        # Compute metrics at best threshold
-        y_pred = (errors > best_threshold).astype(int)
-        
-        tn = ((y_pred == 0) & (y_test == 0)).sum()
-        fp = ((y_pred == 1) & (y_test == 0)).sum()
-        fn = ((y_pred == 0) & (y_test == 1)).sum()
-        tp = ((y_pred == 1) & (y_test == 1)).sum()
-        
-        metrics = {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred, zero_division=0),
-            'recall': recall_score(y_test, y_pred, zero_division=0),
-            'f1': best_f1,
-            'fpr': fp / (fp + tn) if (fp + tn) > 0 else 0,
-            'threshold': best_threshold,
-            'error_normal_mean': errors[y_test == 0].mean(),
-            'error_insider_mean': errors[y_test == 1].mean(),
-        }
-        
-        return metrics
-    
-    def train(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        X_test: np.ndarray = None,
-        y_test: np.ndarray = None,
-        early_stopping_patience: int = 20,
-        test_eval_interval: int = 10
-    ) -> dict:
-        """
-        Full training loop.
-        
-        Args:
-            train_loader: Training data loader
-            val_loader: Validation data loader
-            X_test: Test features (optional, for monitoring only)
-            y_test: Test labels (optional, for monitoring only)
-            early_stopping_patience: Patience for early stopping
-            test_eval_interval: Evaluate on test every N epochs (monitoring only)
-        
-        Returns:
-            Training history dictionary
-        """
-        print("\n" + "=" * 60)
-        print("TRAINING LSTM-AUTOENCODER")
-        print("=" * 60)
-        print(f"  Device: {self.device}")
-        print(f"  Epochs: {self.epochs}")
-        print(f"  Batch size: {self.batch_size}")
-        print(f"  Learning rate: {self.lr}")
-        print(f"  Training samples: {len(train_loader.dataset):,}")
-        print(f"  Validation samples: {len(val_loader.dataset):,}")
-        print(f"  Model parameters: {count_parameters(self.model):,}")
-        if X_test is not None:
-            print(f"  Test monitoring: every {test_eval_interval} epochs")
-        
-        history = {'train_loss': [], 'val_loss': [], 'recon_stats': [], 'test_metrics': []}
-        patience_counter = 0
-        
-        for epoch in range(1, self.epochs + 1):
-            # Train (with batch-level progress bar)
-            train_loss = self.train_epoch(train_loader, epoch, self.epochs)
-            val_loss, recon_stats = self.validate(val_loader)
-            
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-            history['recon_stats'].append(recon_stats)
-            
-            # Log losses to TensorBoard
-            self.writer.add_scalar('Loss/train', train_loss, epoch)
-            self.writer.add_scalar('Loss/val', val_loss, epoch)
-            
-            # Log reconstruction error stats to TensorBoard
-            self.writer.add_scalar('ReconError/mean', recon_stats['mean'], epoch)
-            self.writer.add_scalar('ReconError/std', recon_stats['std'], epoch)
-            self.writer.add_scalar('ReconError/p95', recon_stats['p95'], epoch)
-            self.writer.add_scalar('ReconError/p99', recon_stats['p99'], epoch)
-            
-            # Test monitoring (every N epochs) - FOR MONITORING ONLY
-            if X_test is not None and epoch % test_eval_interval == 0:
-                test_metrics = self.evaluate_test(X_test, y_test)
-                history['test_metrics'].append({'epoch': epoch, **test_metrics})
-                
-                # Log to TensorBoard under 'TestMonitor/' prefix
-                self.writer.add_scalar('TestMonitor/Accuracy', test_metrics['accuracy'], epoch)
-                self.writer.add_scalar('TestMonitor/Precision', test_metrics['precision'], epoch)
-                self.writer.add_scalar('TestMonitor/Recall', test_metrics['recall'], epoch)
-                self.writer.add_scalar('TestMonitor/F1', test_metrics['f1'], epoch)
-                self.writer.add_scalar('TestMonitor/FPR', test_metrics['fpr'], epoch)
-                self.writer.add_scalar('TestMonitor/ErrorNormalMean', test_metrics['error_normal_mean'], epoch)
-                self.writer.add_scalar('TestMonitor/ErrorInsiderMean', test_metrics['error_insider_mean'], epoch)
-            
-            # Check for best model (ONLY uses val loss, NOT test metrics)
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_loss
-                self.best_epoch = epoch
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            # Save checkpoint
-            self.save_checkpoint(epoch, val_loss, is_best)
-            
-            # Print epoch summary
-            best_marker = " *best" if is_best else ""
-            print(f"  → Train: {train_loss:.4f}, Val: {val_loss:.4f}{best_marker}")
-            
-            # Early stopping (based on val loss, NOT test metrics)
-            if patience_counter >= early_stopping_patience:
-                print(f"\n  Early stopping at epoch {epoch} "
-                      f"(best: {self.best_epoch}, val_loss: {self.best_val_loss:.6f})")
+        total_grad_norm = 0.0
+        n_batches = 0
+        use_amp = scaler is not None
+        behavioral_idx = model.behavioral_indices
+
+        loop = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
+        for i, (x_cont, x_cat) in enumerate(loop):
+            if self.dry_run_steps is not None and n_batches >= self.dry_run_steps:
                 break
+            global_step = (epoch - 1) * len(loader) + i
+            x_cont = x_cont.to(device)
+            x_cat = x_cat.to(device)
 
-        
-        self.writer.close()
-        
-        print("\n" + "=" * 60)
-        print("TRAINING COMPLETE!")
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                predictions = model(x_cont, x_cat)
+                loss = full_reconstruction_loss(predictions, x_cont, behavioral_idx)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.clip_norm)
+                optimizer.step()
+
+            scheduler.step()
+
+            if i % 10 == 0:
+                writer.add_scalar('Train/Loss_Step', loss.item(), global_step)
+                writer.add_scalar('Train/GradNorm_Step', grad_norm.item(), global_step)
+                writer.add_scalar('Train/LR_Step', optimizer.param_groups[0]['lr'], global_step)
+
+            total_loss += loss.item()
+            total_grad_norm += grad_norm.item()
+            n_batches += 1
+            loop.set_postfix(loss=loss.item(), grad=grad_norm.item())
+
+        return total_loss / max(n_batches, 1), total_grad_norm / max(n_batches, 1)
+
+    @torch.no_grad()
+    def _validate(self, model, loader, device):
+        """Validation reconstruction error."""
+        model.eval()
+        total_loss = 0.0
+        n_batches = 0
+
+        for x_cont, x_cat in loader:
+            if self.dry_run_steps is not None and n_batches >= self.dry_run_steps:
+                break
+            x_cont = x_cont.to(device)
+            x_cat = x_cat.to(device)
+
+            predictions = model(x_cont, x_cat)
+            loss = full_reconstruction_loss(predictions, x_cont, model.behavioral_indices)
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        return total_loss / max(n_batches, 1)
+
+    # ------------------------------------------------------------------
+    # Test monitoring helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_detection_latency(y_test, test_scores, user_ids, timestamps=None):
+        """Lightweight latency computation for training-time monitoring."""
+        precisions, recalls, thresholds = precision_recall_curve(y_test, test_scores)
+        f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-10)
+        best_thresh = thresholds[np.argmax(f1s)]
+        y_pred = (test_scores >= best_thresh).astype(int)
+
+        insider_users = np.unique(user_ids[y_test == 1])
+        latencies_seq = []
+        latencies_hours = []
+        caught = 0
+
+        for u in insider_users:
+            mask = user_ids == u
+            u_labels = y_test[mask]
+            u_preds = y_pred[mask]
+
+            insider_idx = np.where(u_labels == 1)[0]
+            detected_idx = np.where((u_preds == 1) & (u_labels == 1))[0]
+
+            if len(detected_idx) > 0:
+                caught += 1
+                lat_seq = int(detected_idx[0] - insider_idx[0])
+                latencies_seq.append(lat_seq)
+
+                if timestamps is not None:
+                    u_ts = timestamps[mask]
+                    try:
+                        fi_ts = u_ts[insider_idx[0]]
+                        fd_ts = u_ts[detected_idx[0]]
+                        delta_h = float((fd_ts - fi_ts) / np.timedelta64(1, 'h'))
+                        latencies_hours.append(delta_h)
+                    except (ValueError, TypeError):
+                        pass
+
+        result = {
+            'threshold': float(best_thresh),
+            'user_detection_rate': caught / max(len(insider_users), 1),
+        }
+        if latencies_seq:
+            result['mean_latency_seq'] = float(np.mean(latencies_seq))
+        if latencies_hours:
+            result['mean_latency_hours'] = float(np.mean(latencies_hours))
+            result['median_latency_hours'] = float(np.median(latencies_hours))
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+
+    def _make_checkpoint(self, model, optimizer, scheduler, scaler,
+                         epoch, val_loss, n_continuous, cat_cardinalities,
+                         behavioral_indices):
+        """Build a checkpoint dict."""
+        ckpt = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'val_loss': val_loss,
+            'config': self.config,
+            'n_continuous': n_continuous,
+            'cat_cardinalities': cat_cardinalities,
+            'behavioral_indices': behavioral_indices,
+        }
+        if scaler is not None:
+            ckpt['scaler_state_dict'] = scaler.state_dict()
+        return ckpt
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self):
+        """Execute the full training pipeline."""
         print("=" * 60)
-        print(f"  Best epoch: {self.best_epoch}")
-        print(f"  Best val loss: {self.best_val_loss:.6f}")
-        print(f"  Model saved: {self.model_dir / 'checkpoint_best.pt'}")
-        
-        return history
+        print("INSIDER TRANSFORMER AE — TRAINING")
+        print("=" * 60)
+        if self.dry_run:
+            print(f"  DRY RUN: 1 epoch, up to {self.dry_run_steps} steps per phase. "
+                  f"Outputs under {self.output_dir}.")
+        print(f"  Epochs: {self.epochs}, Batch: {self.batch_size}, LR: {self.lr}")
+        print(f"  Weight decay: {self.weight_decay}, Grad clip: {self.clip_norm}, "
+              f"Patience: {self.patience}")
 
+        set_seed(self.seed)
+        device = get_device()
+        use_amp = torch.cuda.is_available() and self.use_amp
+        if use_amp:
+            print(f"  Mixed precision (AMP): enabled")
+        else:
+            print(f"  Mixed precision (AMP): disabled")
 
-def main():
-    """Main training entry point."""
-    config = load_config()
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load data
-    print("\nLoading data...")
-    X_train, X_val, X_test, y_test = load_data(config)
-    print(f"  Train: {X_train.shape}")
-    print(f"  Val: {X_val.shape}")
-    print(f"  Test: {X_test.shape}")
-    print(f"  Test insiders: {y_test.sum():,}")
-    print(f"  Test normals: {(y_test == 0).sum():,}")
-    
-    # Create dataloaders
-    batch_size = config['training']['batch_size']
-    train_loader, val_loader = create_dataloaders(X_train, X_val, batch_size)
-    
-    # Create model
-    model = create_model(config)
-    print(f"\nModel created: {count_parameters(model):,} parameters")
-    
-    # Create trainer and train
-    # Test data passed for MONITORING ONLY - does not influence model selection
-    trainer = Trainer(model, config, device)
-    history = trainer.train(
-        train_loader, 
-        val_loader,
-        X_test=X_test,
-        y_test=y_test,
-        test_eval_interval=10  # Monitor test metrics every 10 epochs
-    )
-    
-    # Save training history
-    project_root = Path(__file__).parent.parent.parent
-    np.save(project_root / "outputs" / "training_history.npy", history)
-    print(f"\nTraining history saved to outputs/training_history.npy")
+        # [1] Load data
+        print("\n[1] Loading data...")
+        train_dataset, val_dataset = self._load_train_val()
 
+        pin = device.type == 'cuda'
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
+                                  shuffle=True, drop_last=True,
+                                  num_workers=0, pin_memory=pin)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
+                                shuffle=False, num_workers=0, pin_memory=pin)
 
-if __name__ == "__main__":
-    main()
+        n_continuous = train_dataset[0][0].shape[-1]
+        print("  Loading test data for monitoring...")
+        test_dataset, y_test, user_ids_test, timestamps_test = self._load_test()
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size,
+                                 shuffle=False, num_workers=0, pin_memory=pin)
+        if timestamps_test is None:
+            print("  [info] timestamps_test.npy not found — time-based latency skipped")
+
+        cat_cardinalities = self._get_cat_cardinalities()
+        behavioral_indices = self._get_behavioral_indices()
+
+        # [2] Create model
+        print("\n[2] Creating model...")
+        model = create_model(self.config, n_continuous, cat_cardinalities, behavioral_indices)
+        model = model.to(device)
+        print(f"  Parameters: {count_parameters(model):,}")
+        print(f"  d_model={model.d_model}, n_continuous={n_continuous}")
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr,
+                                      weight_decay=self.weight_decay)
+        scheduler = create_scheduler(optimizer, self.epochs, self.warmup_epochs,
+                                     len(train_loader))
+        scaler = GradScaler('cuda') if use_amp else None
+
+        writer = SummaryWriter(log_dir=str(self.output_dir / 'logs'))
+
+        # Resume from checkpoint
+        start_epoch = 1
+        best_val_loss = float('inf')
+        best_epoch = 0
+        history = {'train_loss': [], 'val_loss': [], 'lr': [], 'grad_norm': []}
+
+        if self.resume and not self.dry_run:
+            ckpt_path = self.output_dir / 'best_model.pt'
+            if ckpt_path.exists():
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                model.load_state_dict(ckpt['model_state_dict'])
+                if 'optimizer_state_dict' in ckpt:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if 'scheduler_state_dict' in ckpt:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                if scaler is not None and 'scaler_state_dict' in ckpt:
+                    scaler.load_state_dict(ckpt['scaler_state_dict'])
+                start_epoch = ckpt['epoch'] + 1
+                best_val_loss = ckpt['val_loss']
+                best_epoch = ckpt['epoch']
+                print(f"  Resumed from epoch {ckpt['epoch']} (val_loss={best_val_loss:.6f})")
+
+                hist_path = self.output_dir / 'training_history.json'
+                if hist_path.exists():
+                    with open(hist_path, 'r') as f:
+                        history = json.load(f)
+                        if 'grad_norm' not in history:
+                            history['grad_norm'] = [0.0] * len(history['train_loss'])
+            else:
+                print(f"  No checkpoint found, starting fresh")
+
+        # [3] Training loop
+        print(f"\n[3] Training (epochs {start_epoch}-{self.epochs})...")
+        epochs_no_improve = 0
+        epoch = start_epoch - 1
+        val_loss = best_val_loss
+        t_total = time.time()
+
+        try:
+            for epoch in range(start_epoch, self.epochs + 1):
+                t0 = time.time()
+                train_loss, grad_norm = self._train_epoch(
+                    model, train_loader, optimizer, scheduler, scaler, device, writer, epoch,
+                )
+                val_loss = self._validate(model, val_loader, device)
+                current_lr = optimizer.param_groups[0]['lr']
+                elapsed = time.time() - t0
+
+                global_step_end = epoch * len(train_loader)
+                writer.add_scalar('Train/Loss_Epoch', train_loss, epoch)
+                writer.add_scalar('Val/Loss_Epoch', val_loss, epoch)
+                writer.add_scalar('Val/Loss_Step', val_loss, global_step_end)
+                writer.add_scalar('Train/GradNorm_Epoch', grad_norm, epoch)
+                writer.add_scalar('Train/LR_Epoch', current_lr, epoch)
+
+                if epoch % self.eval_interval == 0 and not self.dry_run:
+                    print(f"\n  [Test Eval] Running scoring on {len(y_test)} sequences...")
+                    test_scores = score_dataset(model, test_loader, device)
+                    test_metrics = compute_ranking_metrics(y_test, test_scores)
+
+                    normal_mask = y_test == 0
+                    insider_mask = y_test == 1
+                    normal_mean = float(test_scores[normal_mask].mean())
+                    insider_mean = float(test_scores[insider_mask].mean())
+
+                    print(f"  [Test Eval] AUC: {test_metrics['auc']:.4f}, "
+                          f"AUPRC: {test_metrics['auprc']:.4f}")
+                    writer.add_scalar('Test/AUC', test_metrics['auc'], epoch)
+                    writer.add_scalar('Test/AUPRC', test_metrics['auprc'], epoch)
+                    writer.add_scalar('Test/ScoreMean_Normal', normal_mean, epoch)
+                    writer.add_scalar('Test/ScoreMean_Insider', insider_mean, epoch)
+                    writer.add_scalar('Test/ScoreRatio',
+                                      insider_mean / max(normal_mean, 1e-10), epoch)
+
+                    lat = self._compute_detection_latency(
+                        y_test, test_scores, user_ids_test, timestamps_test
+                    )
+                    writer.add_scalar('Test/BestF1_Threshold', lat['threshold'], epoch)
+                    writer.add_scalar('Test/UserDetectionRate', lat['user_detection_rate'], epoch)
+                    if 'mean_latency_seq' in lat:
+                        writer.add_scalar('Test/MeanLatency_Sequences', lat['mean_latency_seq'], epoch)
+                    if 'mean_latency_hours' in lat:
+                        writer.add_scalar('Test/MeanLatency_Hours', lat['mean_latency_hours'], epoch)
+                        writer.add_scalar('Test/MedianLatency_Hours', lat['median_latency_hours'], epoch)
+
+                    det_str = f"det_rate={lat['user_detection_rate']:.0%}"
+                    if 'mean_latency_hours' in lat:
+                        det_str += f", latency={lat['mean_latency_hours']:.1f}h"
+                    elif 'mean_latency_seq' in lat:
+                        det_str += f", latency={lat['mean_latency_seq']:.1f} seqs"
+                    print(f"  [Test Eval] {det_str}")
+
+                    threshold = lat.get('threshold', 0.0)
+                    y_pred = (test_scores >= threshold).astype(int)
+                    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
+                    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+                    fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+                    print(f"  [Test Eval] Confusion Matrix (Insider=positive):")
+                    print(f"    TN: {tn:5d} | FP: {fp:5d}")
+                    print(f"    FN: {fn:5d} | TP: {tp:5d}")
+                    print(f"    FPR: {fpr:.2%} | FNR: {fnr:.2%}")
+                    writer.add_scalar('Test/CM_TN', tn, epoch)
+                    writer.add_scalar('Test/CM_FP', fp, epoch)
+                    writer.add_scalar('Test/CM_FN', fn, epoch)
+                    writer.add_scalar('Test/CM_TP', tp, epoch)
+                    writer.add_scalar('Test/FPR', fpr, epoch)
+                    writer.add_scalar('Test/FNR', fnr, epoch)
+
+                    model.train()
+
+                history['train_loss'].append(train_loss)
+                history['val_loss'].append(val_loss)
+                history['lr'].append(current_lr)
+                history['grad_norm'].append(grad_norm)
+
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    epochs_no_improve = 0
+                    ckpt_dict = self._make_checkpoint(
+                        model, optimizer, scheduler, scaler, epoch, val_loss,
+                        n_continuous, cat_cardinalities, behavioral_indices,
+                    )
+                    torch.save(ckpt_dict, self.output_dir / 'best_model.pt')
+                    with open(self.output_dir / 'training_history.json', 'w') as f:
+                        json.dump(history, f)
+                else:
+                    epochs_no_improve += 1
+
+                if self.checkpoint_interval > 0 and epoch % self.checkpoint_interval == 0:
+                    latest_ckpt = self._make_checkpoint(
+                        model, optimizer, scheduler, scaler, epoch, val_loss,
+                        n_continuous, cat_cardinalities, behavioral_indices,
+                    )
+                    torch.save(latest_ckpt, self.output_dir / 'latest_model.pt')
+
+                if epoch <= 10 or epoch % 5 == 0 or improved:
+                    star = " ★" if improved else ""
+                    print(f"  Epoch {epoch:3d}/{self.epochs} | "
+                          f"train={train_loss:.6f} val={val_loss:.6f} | "
+                          f"lr={current_lr:.2e} gnorm={grad_norm:.2f} | "
+                          f"{elapsed:.1f}s{star}")
+
+                if epochs_no_improve >= self.patience:
+                    print(f"\n  Early stopping at epoch {epoch} "
+                          f"(no improvement for {self.patience} epochs)")
+                    break
+
+        finally:
+            history['last_epoch'] = epoch
+            with open(self.output_dir / 'training_history.json', 'w') as f:
+                json.dump(history, f)
+            writer.close()
+
+        total_time = time.time() - t_total
+        print(f"\n  Best: epoch {best_epoch}, val_loss={best_val_loss:.6f}")
+        print(f"  Total training time: {total_time:.1f}s "
+              f"({total_time/60:.1f}m)")
+
+        # [4] Save final model
+        print(f"\n[4] Saving outputs...")
+        final_ckpt = self._make_checkpoint(
+            model, optimizer, scheduler, scaler, epoch, val_loss,
+            n_continuous, cat_cardinalities, behavioral_indices,
+        )
+        torch.save(final_ckpt, self.output_dir / 'final_model.pt')
+
+        print(f"  Saved: best_model.pt (epoch {best_epoch})")
+        print(f"  Saved: final_model.pt (epoch {epoch})")
+        if self.checkpoint_interval > 0:
+            latest_epoch = (epoch // self.checkpoint_interval) * self.checkpoint_interval
+            if latest_epoch > 0:
+                print(f"  Saved: latest_model.pt (epoch {latest_epoch})")
+        print(f"  Saved: training_history.json ({len(history['train_loss'])} epochs)")
+        if self.dry_run:
+            print("\nDry run complete. Checkpoints under outputs/dry_run/.")
+        print("\nTraining complete! Next: python scripts/04_evaluate.py")

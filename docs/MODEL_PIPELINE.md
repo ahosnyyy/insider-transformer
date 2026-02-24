@@ -78,12 +78,16 @@ These provide user context but aren't behavioral, so the model shouldn't be pena
 
 ## 2. Training Pipeline
 
-### 2.1 Training Script: `scripts/03_train.py`
+### 2.1 Training: `scripts/03_train.py` → `src/training/trainer.py`
 
-The training script orchestrates the entire training process:
+The training script is a thin CLI wrapper that delegates to the `Trainer` class in `src/training/trainer.py`:
 
 ```bash
-python scripts/03_train.py [--config config/config.yaml] [--seed 42]
+python scripts/03_train.py                                    # Default (AMP disabled)
+python scripts/03_train.py --epochs 100 --batch-size 128      # Override hyperparameters
+python scripts/03_train.py --resume                            # Resume from checkpoint
+python scripts/03_train.py --amp                               # Enable mixed precision
+python scripts/03_train.py --dry-run                           # Test pipeline (1 epoch)
 ```
 
 ### 2.2 Training Flow
@@ -177,15 +181,17 @@ augmentation:
 
 ## 3. Evaluation Pipeline
 
-### 3.1 Evaluation Script: `scripts/04_evaluate.py`
+### 3.1 Evaluation: `scripts/04_evaluate.py` → `src/evaluation/evaluator.py`
 
-Comprehensive evaluation of the trained model:
+The evaluation script is a thin CLI wrapper that delegates to the `Evaluator` class in `src/evaluation/evaluator.py`:
 
 ```bash
-python scripts/04_evaluate.py [--config config/config.yaml] \
-                            [--checkpoint checkpoints/best_model.pt] \
-                            [--use-augmented] \
-                            [--threshold-method best_f1]
+python scripts/04_evaluate.py                                  # Default (AMP disabled)
+python scripts/04_evaluate.py --amp                            # Enable mixed precision
+python scripts/04_evaluate.py --use-augmented                  # Augmented test set
+python scripts/04_evaluate.py --exclude-scenarios 3            # Exclude scenarios
+python scripts/04_evaluate.py --load-scores                    # Skip re-scoring
+python scripts/04_evaluate.py --dry-run                        # Dry-run checkpoints
 ```
 
 ### 3.2 Evaluation Process
@@ -309,14 +315,14 @@ This approach evaluates the model's precision at the session level - crucial for
 
 ## 4. Visualization Pipeline
 
-### 4.1 Plotting Script: `scripts/05_plot.py`
+### 4.1 Plotting: `scripts/05_plot.py` → `src/visualization/plotter.py`
 
-Comprehensive visualization of model performance and data:
+The plotting script is a thin CLI wrapper that delegates to the `Plotter` class in `src/visualization/plotter.py`:
 
 ```bash
-python scripts/05_plot.py [--config config/config.yaml] \
-                         [--use-augmented] \
-                         [--output-dir plots/]
+python scripts/05_plot.py                                      # Default
+python scripts/05_plot.py --use-augmented                      # Augmented test labels
+python scripts/05_plot.py --dry-run                            # Plot from dry-run outputs
 ```
 
 ### 4.2 Generated Plots
@@ -393,18 +399,17 @@ plot_config = {
 
 ## 5. Inference Pipeline
 
-### 5.1 Inference Script: `scripts/06_inference.py`
+### 5.1 Inference: `scripts/06_inference.py` → `src/inference/runner.py`
 
-Real-time inference on new data:
+The inference script is a thin CLI wrapper that delegates to the `InferenceRunner` class in `src/inference/runner.py`:
 
 ```bash
-python scripts/06_inference.py [--config config/config.yaml] \
-                              [--checkpoint checkpoints/best_model.pt] \
-                              [--users "user1,user2"] \
-                              [--start-date 2011-01-01] \
-                              [--end-date 2011-01-31] \
-                              [--threshold-method best_f1] \
-                              [--top-k 10]
+python scripts/06_inference.py                                 # Score all users
+python scripts/06_inference.py --amp                           # Enable mixed precision
+python scripts/06_inference.py --user-id ACME/user123          # Score one user
+python scripts/06_inference.py --threshold 0.85                # Custom threshold
+python scripts/06_inference.py --top-k 20                      # Top 20 riskiest
+python scripts/06_inference.py --start-date 2011-03-01 --end-date 2011-04-01
 ```
 
 ### 5.2 Inference Features
@@ -510,28 +515,47 @@ evaluation:
 
 ## 8. File Structure
 
+Scripts are thin CLI wrappers (~40-80 lines) that delegate to core classes in `src/`.
+
 ```
 insider-transformer/
-├── scripts/
-│   ├── 01_download_data.py      # Data download
-│   ├── 02_feature_engineering.py # Feature computation
-│   ├── 03_train.py              # Model training
-│   ├── 04_evaluate.py           # Model evaluation
-│   ├── 05_plot.py               # Visualization
-│   └── 06_inference.py          # Real-time inference
-├── src/
+├── scripts/                           # Thin CLI wrappers
+│   ├── 01_prepare_data.py             # Data prep wrapper → src/data/
+│   ├── 02_feature_engineering.py      # Feature eng wrapper → src/data/
+│   ├── 03_train.py                    # Training wrapper → Trainer
+│   ├── 04_evaluate.py                 # Evaluation wrapper → Evaluator
+│   ├── 05_plot.py                     # Plotting wrapper → Plotter
+│   └── 06_inference.py                # Inference wrapper → InferenceRunner
+├── src/                               # Core logic
 │   ├── data/
-│   │   └── feature_engineering.py # SQL feature pipeline
+│   │   ├── feature_engineering.py     # SQL feature pipeline
+│   │   ├── sequence_creation.py       # Sequence generation
+│   │   └── augmentation.py           # Test set augmentation
 │   ├── models/
-│   │   └── transformer.py       # Transformer architecture
+│   │   └── transformer.py            # InsiderTransformerAE architecture
+│   ├── training/
+│   │   └── trainer.py                # Trainer class (loop, checkpointing, TensorBoard)
 │   ├── evaluation/
-│   │   ├── scoring.py           # Anomaly scoring
-│   │   └── helpers.py           # Evaluation utilities
-│   └── sequence_creation.py     # Sequence generation
+│   │   ├── evaluator.py              # Evaluator class (scoring, thresholds, metrics, SOC)
+│   │   ├── scoring.py                # Anomaly scoring functions
+│   │   └── helpers.py                # Evaluation utilities
+│   ├── visualization/
+│   │   └── plotter.py                # Plotter class (11 publication-quality plots)
+│   ├── inference/
+│   │   └── runner.py                 # InferenceRunner class (feature eng → scoring → reports)
+│   └── utils/                        # Config loading, seeding, device selection
 ├── config/
-│   └── config.yaml              # Central configuration
-├── checkpoints/                 # Model checkpoints
-├── data/processed/              # Processed features
-├── plots/                       # Generated visualizations
-└── results/                     # Evaluation outputs
+│   └── config.yaml                    # Central configuration
+├── data/
+│   ├── raw/                           # CERT R4.2 raw CSVs
+│   ├── parquet/                       # Parquet intermediates
+│   └── processed/                     # Feature arrays, DuckDB, artifacts
+├── outputs/                           # Checkpoints, scores, plots, reports
+│   ├── best_model.pt
+│   ├── training_history.json
+│   ├── evaluation_results.json
+│   ├── soc_report.json
+│   ├── plots/                         # 11 PNG files + individual timelines
+│   └── logs/                          # TensorBoard event files
+└── docs/                              # Architecture documentation
 ```
