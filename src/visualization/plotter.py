@@ -141,12 +141,12 @@ def plot_score_distribution(scores: np.ndarray, y: np.ndarray,
     thresh_results = eval_results.get('threshold_results', {})
     best_f1 = thresh_results.get('best_f1', {})
     if best_f1:
-        ax.axvline(best_f1['threshold'], color='red', linestyle='--', linewidth=1.5,
+        ax.axvline(best_f1['threshold'], color='green', linestyle='--', linewidth=1.5,
                     label=f"best_f1 = {best_f1['threshold']:.4f}")
 
     sep = eval_results.get('score_separation', {})
     if 'normal_p95' in sep:
-        ax.axvline(sep['normal_p95'], color='green', linestyle=':', linewidth=1.5,
+        ax.axvline(sep['normal_p95'], color='orange', linestyle=':', linewidth=1.5,
                     label=f"Normal P95 = {sep['normal_p95']:.4f}")
 
     gm = eval_results.get('global_metrics', {})
@@ -318,17 +318,26 @@ def plot_score_scatter(scores: np.ndarray, y: np.ndarray,
                        eval_results: dict, plots_dir: Path):
     normal_idx = np.where(y == 0)[0]
     insider_idx = np.where(y == 1)[0]
+    
+    # Create randomized x-axis positions for better visualization
+    total_samples = len(scores)
+    all_positions = np.arange(total_samples)
+    np.random.shuffle(all_positions)
+    
+    # Split shuffled positions between normal and insider
+    normal_positions = all_positions[:len(normal_idx)]
+    insider_positions = all_positions[len(normal_idx):len(normal_idx) + len(insider_idx)]
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.scatter(normal_idx, scores[normal_idx], c='#3498db', alpha=0.4,
+    ax.scatter(normal_positions, scores[normal_idx], c='#3498db', alpha=0.4,
                s=8, label='Normal', rasterized=True, edgecolors='none')
-    ax.scatter(insider_idx, scores[insider_idx], c='#e74c3c', alpha=0.7,
+    ax.scatter(insider_positions, scores[insider_idx], c='#e74c3c', alpha=0.7,
                s=10, label='Insider', rasterized=True, edgecolors='none')
 
     thresh_results = eval_results.get('threshold_results', {})
     best_f1 = thresh_results.get('best_f1', {})
     if best_f1:
-        ax.axhline(best_f1['threshold'], color='red', linestyle='--', linewidth=1.5,
+        ax.axhline(best_f1['threshold'], color='green', linestyle='--', linewidth=1.5,
                     label=f"Threshold = {best_f1['threshold']:.4f}")
 
     ax.set_xlabel('Sample Index', fontsize=11)
