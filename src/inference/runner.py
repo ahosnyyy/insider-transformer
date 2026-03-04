@@ -78,13 +78,13 @@ def load_threshold(output_dir: Path, method: str) -> float:
     if eval_path.exists():
         with open(eval_path, 'r') as f:
             results = json.load(f)
-        thresholds = results.get('thresholds', {})
+        thresholds = results.get('threshold_results', {})
         if method in thresholds:
-            return thresholds[method]['value']
+            return thresholds[method]['threshold']
         for m in ['best_f1', 'percentile_99', 'mean_plus_3std', 'percentile_95']:
             if m in thresholds:
                 print(f"  [info] Requested '{method}' not found, using '{m}'")
-                return thresholds[m]['value']
+                return thresholds[m]['threshold']
 
     cal_path = output_dir / 'calibration_scores.npy'
     if cal_path.exists():
