@@ -368,6 +368,57 @@ Each user entry includes:
 
 ---
 
+## Database Inspection
+
+Use the inspection script to explore the DuckDB database structure and verify data ingestion. The script ATTACHes the database as `src` schema (matching the feature engineering pipeline).
+
+```bash
+# List all tables with row counts (default database path)
+python tests/inspect_duckdb.py
+
+# Inspect a specific table (events, users, insiders, etc.)
+python tests/inspect_duckdb.py --table events --limit 5
+
+# Deep analysis of events table (time range, activity types, top users)
+python tests/inspect_duckdb.py --events
+
+# Inspect all 7 tables with full details
+python tests/inspect_duckdb.py --all
+
+# Use custom database path
+python tests/inspect_duckdb.py /path/to/custom.duckdb
+```
+
+### Database Structure
+
+The script connects to `data/processed/insider.duckdb` and exposes these tables as `src.table_name`:
+
+| Table | Description | Typical Size |
+|---|---|---|
+| `src.events` | Unified activity logs (logon, device, email, file, http) | 32M+ rows |
+| `src.users` | Latest LDAP snapshot per user with role/department | 5K+ users |
+| `src.insiders` | Ground truth threat labels with scenarios | 70+ users |
+| `src.psychometric` | Big Five personality scores (O, C, E, A, N) | 4K+ users |
+| `src.user_changes` | Monthly role/department/functional_unit changes | 10K+ records |
+| `src.terminated_users` | Employee termination dates | 200+ users |
+| `src.functional_unit_encoding` | Functional unit name → integer mapping | 6 entries |
+
+### Inspection Features
+
+- **Schema analysis**: Column names, data types, row counts
+- **Sample data**: First N rows with formatted display
+- **Statistics**: Numeric column ranges, means, distinct values
+- **Categorical analysis**: Top values for text columns
+- **Events deep dive**: Time range, activity breakdown, user patterns, PC usage
+
+This is useful for:
+- Verifying data ingestion after `01_prepare_data.py`
+- Understanding table schemas before feature engineering
+- Debugging SQL queries in `feature_engineering.py`
+- Exploring data distributions and patterns
+
+---
+
 ## Configuration
 
 All parameters in `config/config.yaml`. Key sections:
